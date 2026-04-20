@@ -745,4 +745,107 @@ suite('ChatPlanningQuestionGenerator', () => {
 
 		assert.strictEqual(capturedModelId, 'plan-model');
 	});
+
+	test('prefers provider-backed models over stale cached model ids', async () => {
+		let capturedModelId: string | undefined;
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['copilot/auto', 'plan-model'],
+			getVendors: () => [],
+			lookupLanguageModel: (modelId: string) => {
+				if (modelId === 'copilot/auto') {
+					return { vendor: 'copilot', id: 'auto', capabilities: { toolCalling: true } };
+				}
+				return { vendor: 'test-vendor', id: 'plan-model', capabilities: { toolCalling: true } };
+			},
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async (selector: { vendor?: string }) => selector.vendor === 'copilot' ? [] : ['plan-model'],
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async (modelId: string) => {
+				capturedModelId = modelId;
+				return {
+					stream: (async function* () {
+						yield {
+							type: 'text' as const,
+							value: JSON.stringify({
+								questions: [
+									{ title: 'Goal', message: 'What should happen?', type: 'text' },
+									{
+										title: 'Constraint',
+										message: 'What should the planner optimize for?',
+										type: 'singleSelect',
+										options: [
+											{ label: 'Minimal surface area', value: 'Minimal surface area' },
+											{ label: 'Fastest path', value: 'Fastest path' }
+										]
+									},
+									{ title: 'Definition of done', message: 'What must be clarified?', type: 'text' }
+								]
+							})
+						};
+					})(),
+					result: Promise.resolve({})
+				};
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		await generateDynamicPlanningQuestions(service, {
+			userRequest: 'Plan a change',
+			modelId: 'copilot/auto',
+			planningPhase: 'broad-scan',
+			questionStage: 'goal-clarity',
+			recentConversation: [],
+			planningAnswers: [],
+		}, CancellationToken.None);
+
+		assert.strictEqual(capturedModelId, 'plan-model');
+	});
+
+	test('surfaces a friendly error when no registered model provider is ready', async () => {
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['copilot/auto'],
+			getVendors: () => [],
+			lookupLanguageModel: () => ({ vendor: 'copilot', id: 'auto', capabilities: { toolCalling: true } }),
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async () => [],
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async () => {
+				throw new Error('Chat provider for model copilot/auto is not registered.');
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		await assert.rejects(() => generateDynamicPlanningQuestions(service, {
+			userRequest: 'Plan a change',
+			modelId: 'copilot/auto',
+			planningPhase: 'broad-scan',
+			questionStage: 'goal-clarity',
+			recentConversation: [],
+			planningAnswers: [],
+		}, CancellationToken.None), /No active language model is ready to generate planning questions yet/);
+	});
 });

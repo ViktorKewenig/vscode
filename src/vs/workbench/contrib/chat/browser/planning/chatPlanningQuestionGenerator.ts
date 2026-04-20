@@ -3,7 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { timeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
+import { Event } from '../../../../../base/common/event.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { localize } from '../../../../../nls.js';
 import { IChatQuestion } from '../../common/chatService/chatService.js';
@@ -55,14 +57,6 @@ export async function generateDynamicPlanningQuestions(
 	token: CancellationToken
 ): Promise<IChatQuestion[]> {
 	const requestedQuestionCount = clampRequestedQuestionCount(context.questionCount);
-	const candidateModelIds = getCandidateModelIds(languageModelsService, context.modelId);
-	if (candidateModelIds.length === 0) {
-		throw new Error(localize(
-			'chat.dynamicPlanning.noLanguageModel',
-			'No language model is available to generate planning questions.'
-		));
-	}
-
 	const prompt = buildPlanningQuestionPrompt(context, requestedQuestionCount);
 	const messages: IChatMessage[] = [
 		{
@@ -126,36 +120,82 @@ export async function generateDynamicPlanningQuestions(
 	];
 
 	let lastError: Error | undefined;
-	for (const modelId of candidateModelIds) {
-		try {
-			const normalized = requestedQuestionCount > 0
-				? await requestModelPlanningQuestions(languageModelsService, modelId, messages, context, token)
-				: [];
-			const finalized = finalizeGeneratedQuestions(normalized, context);
-			if (finalized.length > 0) {
-				return finalized;
+	let providerRetryAttempted = false;
+	while (true) {
+		const candidateModelIds = await getCandidateModelIds(languageModelsService, context.modelId);
+		if (candidateModelIds.length === 0) {
+			if (!providerRetryAttempted && shouldWaitForLanguageModelProvider(languageModelsService, context.modelId)) {
+				providerRetryAttempted = true;
+				const changed = await waitForLanguageModelRegistration(languageModelsService, context.modelId, token);
+				if (changed) {
+					continue;
+				}
+
+				throw new Error(localize(
+					'chat.dynamicPlanning.modelProviderUnavailable',
+					'No active language model is ready to generate planning questions yet. Try again in a moment.'
+				));
 			}
 
-			lastError = new Error(localize(
-				'chat.dynamicPlanning.noUsableQuestions',
-				'Language model "{0}" did not return enough usable planning questions.',
-				modelId
+			throw new Error(localize(
+				'chat.dynamicPlanning.noLanguageModel',
+				'No language model is available to generate planning questions.'
 			));
-		} catch (error) {
-			lastError = error instanceof Error
-				? error
-				: new Error(localize('chat.dynamicPlanning.unknownGenerationError', 'Planning question generation failed.'));
 		}
+
+		for (const modelId of candidateModelIds) {
+			try {
+				const normalized = requestedQuestionCount > 0
+					? await requestModelPlanningQuestions(languageModelsService, modelId, messages, context, token)
+					: [];
+				const finalized = finalizeGeneratedQuestions(normalized, context);
+				if (finalized.length > 0) {
+					return finalized;
+				}
+
+				lastError = new Error(localize(
+					'chat.dynamicPlanning.noUsableQuestions',
+					'Language model "{0}" did not return enough usable planning questions.',
+					modelId
+				));
+			} catch (error) {
+				lastError = error instanceof Error
+					? error
+					: new Error(localize('chat.dynamicPlanning.unknownGenerationError', 'Planning question generation failed.'));
+			}
+		}
+
+		if (!providerRetryAttempted && isMissingChatProviderError(lastError)) {
+			providerRetryAttempted = true;
+			const changed = await waitForLanguageModelRegistration(languageModelsService, context.modelId, token);
+			if (changed) {
+				continue;
+			}
+		}
+
+		break;
+	}
+
+	if (isMissingChatProviderError(lastError)) {
+		throw new Error(localize(
+			'chat.dynamicPlanning.modelProviderUnavailable',
+			'No active language model is ready to generate planning questions yet. Try again in a moment.'
+		));
 	}
 
 	throw lastError ?? new Error(localize('chat.dynamicPlanning.unknownGenerationError', 'Planning question generation failed.'));
 }
 
-function getCandidateModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): string[] {
+async function getCandidateModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): Promise<string[]> {
 	const candidateModelIds: string[] = [];
 	const seen = new Set<string>();
+	const providerBackedModelIds = await getProviderBackedModelIds(languageModelsService, preferredModelId);
+	const availableModelIds = providerBackedModelIds.length > 0 ? providerBackedModelIds : languageModelsService.getLanguageModelIds();
 	const pushCandidate = (modelId: string | undefined) => {
 		if (!modelId || seen.has(modelId)) {
+			return;
+		}
+		if (!isExecutablePlanningModelId(modelId)) {
 			return;
 		}
 
@@ -168,20 +208,109 @@ function getCandidateModelIds(languageModelsService: ILanguageModelsService, pre
 		candidateModelIds.push(modelId);
 	};
 
-	pushCandidate(preferredModelId);
+	if (!providerBackedModelIds.length || providerBackedModelIds.includes(preferredModelId ?? '')) {
+		pushCandidate(preferredModelId);
+	}
 
-	for (const modelId of languageModelsService.getLanguageModelIds()) {
+	for (const modelId of availableModelIds) {
 		const metadata = languageModelsService.lookupLanguageModel(modelId);
 		if (metadata?.capabilities?.toolCalling && !metadata.targetChatSessionType) {
 			pushCandidate(modelId);
 		}
 	}
 
-	for (const modelId of languageModelsService.getLanguageModelIds()) {
+	for (const modelId of availableModelIds) {
 		pushCandidate(modelId);
 	}
 
 	return candidateModelIds;
+}
+
+async function getProviderBackedModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): Promise<string[]> {
+	const result = new Set<string>();
+	const preferredMetadata = preferredModelId ? languageModelsService.lookupLanguageModel(preferredModelId) : undefined;
+	const preferredVendor = preferredMetadata?.vendor;
+
+	if (preferredVendor && preferredMetadata?.id) {
+		for (const modelId of await languageModelsService.selectLanguageModels({
+			vendor: preferredVendor,
+			id: preferredMetadata.id,
+			family: preferredMetadata.family,
+			version: preferredMetadata.version,
+		})) {
+			if (isExecutablePlanningModelId(modelId)) {
+				result.add(modelId);
+			}
+		}
+	}
+
+	if (preferredVendor) {
+		for (const modelId of await languageModelsService.selectLanguageModels({ vendor: preferredVendor })) {
+			if (isExecutablePlanningModelId(modelId)) {
+				result.add(modelId);
+			}
+		}
+	}
+
+	for (const modelId of await languageModelsService.selectLanguageModels({})) {
+		if (isExecutablePlanningModelId(modelId)) {
+			result.add(modelId);
+		}
+	}
+
+	return [...result];
+}
+
+function isExecutablePlanningModelId(modelId: string): boolean {
+	return modelId !== 'copilot/auto';
+}
+
+function shouldWaitForLanguageModelProvider(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): boolean {
+	if (!preferredModelId) {
+		return false;
+	}
+
+	if (!isExecutablePlanningModelId(preferredModelId)) {
+		return true;
+	}
+
+	return !!languageModelsService.lookupLanguageModel(preferredModelId)?.vendor;
+}
+
+function isMissingChatProviderError(error: Error | undefined): boolean {
+	return !!error && /Chat provider for model .+ is not registered\./.test(error.message);
+}
+
+async function waitForLanguageModelRegistration(
+	languageModelsService: ILanguageModelsService,
+	preferredModelId: string | undefined,
+	token: CancellationToken,
+): Promise<boolean> {
+	const preferredVendor = preferredModelId ? languageModelsService.lookupLanguageModel(preferredModelId)?.vendor : undefined;
+	const changeEvent = preferredVendor
+		? Event.filter(languageModelsService.onDidChangeLanguageModels, vendor => vendor === preferredVendor)
+		: languageModelsService.onDidChangeLanguageModels;
+	return new Promise<boolean>(resolve => {
+		let done = false;
+		const finish = (changed: boolean) => {
+			if (done) {
+				return;
+			}
+			done = true;
+			listener.dispose();
+			timer.cancel();
+			cancellationListener.dispose();
+			resolve(changed);
+		};
+		const listener = changeEvent(() => {
+			finish(true);
+		});
+		const timer = timeout(1500);
+		timer.then(() => {
+			finish(false);
+		});
+		const cancellationListener = token.onCancellationRequested(() => finish(false));
+	});
 }
 
 async function requestModelPlanningQuestions(

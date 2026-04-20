@@ -1631,7 +1631,7 @@ export function registerChatActions() {
 		constructor() {
 			super({
 				id: OPEN_PLANNING_PLAN_ACTION_ID,
-				title: localize2('openPlanningPlan', 'Open Plan'),
+				title: localize2('openPlanningPlan', 'Open Current Plan'),
 				category: CHAT_CATEGORY,
 				f1: false,
 			});
@@ -1663,7 +1663,7 @@ export function registerChatActions() {
 		constructor() {
 			super({
 				id: OPEN_PLANNING_PLAN_TO_SIDE_ACTION_ID,
-				title: localize2('openPlanningPlanToSide', 'Open Plan to Side'),
+				title: localize2('openPlanningPlanToSide', 'Open Plan Beside'),
 				category: CHAT_CATEGORY,
 				f1: false,
 			});
@@ -1695,7 +1695,7 @@ export function registerChatActions() {
 		constructor() {
 			super({
 				id: OPEN_PLANNING_PLAN_DIFF_ACTION_ID,
-				title: localize2('openPlanningPlanDiff', 'View Plan Changes'),
+				title: localize2('openPlanningPlanDiff', 'Compare Plan Revisions'),
 				category: CHAT_CATEGORY,
 				f1: false,
 			});

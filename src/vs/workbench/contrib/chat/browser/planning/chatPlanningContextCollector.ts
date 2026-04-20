@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
+import { Schemas } from '../../../../../base/common/network.js';
 import { basename, extUri } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ICodeEditor } from '../../../../../editor/browser/editorBrowser.js';
@@ -93,15 +94,18 @@ export async function collectPlanningRepositoryContext(
 	}
 ): Promise<IPlanningRepositoryContext | undefined> {
 	const workspaceFolders = getWorkspaceFolders(services.workspaceContextService);
-	const contextEditors = getContextEditors(input);
-	const primaryEditor = getPrimaryContextEditor(input.activeEditor, contextEditors);
+	const contextEditors = getContextEditors(input, workspaceFolders);
+	const primaryEditor = getPrimaryContextEditor(input.activeEditor, contextEditors, workspaceFolders);
 	const model = primaryEditor?.getModel();
 	const previousRepositoryContext = input.previousRepositoryContext;
 	if (!model && workspaceFolders.length === 0) {
 		return undefined;
 	}
 
-	const activeResource = model?.uri ?? resolvePreviousPlanningResource(previousRepositoryContext, workspaceFolders);
+	const editorResource = model?.uri;
+	const activeResource = editorResource && isUsablePlanningResource(editorResource, workspaceFolders)
+		? editorResource
+		: resolvePreviousPlanningResource(previousRepositoryContext, workspaceFolders);
 	const workspaceFolder = activeResource ? services.workspaceContextService.getWorkspaceFolder(activeResource) : undefined;
 	const workspaceRoot = workspaceFolder?.uri ?? workspaceFolders[0]?.uri;
 	const selection = primaryEditor?.getSelection();
@@ -165,7 +169,7 @@ export async function collectPlanningRepositoryContext(
 	const workspaceSymbolMatches = workspaceRoot
 		? await getWorkspaceSymbolMatches(focus, previousRepositoryContext?.workspaceSymbolMatches)
 		: previousRepositoryContext?.workspaceSymbolMatches ?? [];
-	const nearbyFiles = workspaceRoot && activeResource
+	const nearbyFiles = workspaceRoot && activeResource && canBrowsePlanningResource(activeResource, workspaceFolders)
 		? await getNearbyFiles(services.fileService, workspaceRoot, activeResource, focus, workspaceFolders, previousRepositoryContext?.nearbyFiles)
 		: previousRepositoryContext?.nearbyFiles ?? [];
 	const relevantSnippets = activeResource ? await getRelevantSnippets(
@@ -206,14 +210,14 @@ function getWorkspaceFolders(workspaceContextService: IWorkspaceContextService):
 	}));
 }
 
-function getContextEditors(input: IPlanningContextCollectionInput): ICodeEditor[] {
+function getContextEditors(input: IPlanningContextCollectionInput, workspaceFolders: readonly IWorkspaceFolderInfo[]): ICodeEditor[] {
 	const editors = input.contextEditors?.length ? input.contextEditors : (input.activeEditor ? [input.activeEditor] : []);
 	const seen = new Set<string>();
 	const result: ICodeEditor[] = [];
 
 	for (const editor of editors) {
 		const resource = editor.getModel()?.uri;
-		if (!resource) {
+		if (!resource || !isUsablePlanningResource(resource, workspaceFolders)) {
 			continue;
 		}
 
@@ -229,12 +233,40 @@ function getContextEditors(input: IPlanningContextCollectionInput): ICodeEditor[
 	return result;
 }
 
-function getPrimaryContextEditor(activeEditor: ICodeEditor | undefined, contextEditors: readonly ICodeEditor[]): ICodeEditor | undefined {
-	if (activeEditor?.getModel()) {
+function getPrimaryContextEditor(activeEditor: ICodeEditor | undefined, contextEditors: readonly ICodeEditor[], workspaceFolders: readonly IWorkspaceFolderInfo[]): ICodeEditor | undefined {
+	if (activeEditor?.getModel()?.uri && isUsablePlanningResource(activeEditor.getModel()!.uri, workspaceFolders)) {
 		return activeEditor;
 	}
 
 	return contextEditors[0];
+}
+
+function isTransientPlanningResource(resource: URI): boolean {
+	return resource.scheme === 'gutter-input'
+		|| resource.scheme === Schemas.vscodeChatInput
+		|| resource.scheme === Schemas.vscodeChatCodeBlock
+		|| resource.scheme === Schemas.vscodeChatCodeCompareBlock
+		|| resource.scheme === Schemas.vscodeChatEditor;
+}
+
+function isUsablePlanningResource(resource: URI, workspaceFolders: readonly IWorkspaceFolderInfo[]): boolean {
+	if (isTransientPlanningResource(resource)) {
+		return false;
+	}
+
+	if (resource.scheme === Schemas.untitled || resource.scheme === Schemas.vscodeNotebookCell) {
+		return true;
+	}
+
+	return workspaceFolders.some(folder => extUri.isEqualOrParent(resource, folder.uri));
+}
+
+function canBrowsePlanningResource(resource: URI, workspaceFolders: readonly IWorkspaceFolderInfo[]): boolean {
+	if (isTransientPlanningResource(resource) || resource.scheme === Schemas.untitled || resource.scheme === Schemas.vscodeNotebookCell) {
+		return false;
+	}
+
+	return workspaceFolders.some(folder => extUri.isEqualOrParent(resource, folder.uri));
 }
 
 async function getWorkspaceTopLevelEntries(fileService: IFileService, workspaceFolders: readonly IWorkspaceFolderInfo[]): Promise<string[] | undefined> {

@@ -2967,19 +2967,19 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			kind: 'command',
 			command: {
 				id: OPEN_PLANNING_PLAN_ACTION_ID,
-				title: localize('chat.planReview.openPlan', 'Open Plan'),
+				title: localize('chat.planReview.openPlan', 'Open Current Plan'),
 				arguments: [commandArgs],
 			},
 			additionalCommands: [
 				{
 					id: OPEN_PLANNING_PLAN_TO_SIDE_ACTION_ID,
-					title: localize('chat.planReview.openPlanToSide', 'Open to Side'),
+					title: localize('chat.planReview.openPlanToSide', 'Open Beside'),
 					arguments: [commandArgs],
 				},
 				...(planSnapshot.previousRequestId && planSnapshot.previousPlanText
 					? [{
 						id: OPEN_PLANNING_PLAN_DIFF_ACTION_ID,
-						title: localize('chat.planReview.viewPlanChanges', 'View Changes'),
+						title: localize('chat.planReview.viewPlanChanges', 'Compare Revisions'),
 						arguments: [commandArgs],
 					}]
 					: []),
@@ -3034,6 +3034,15 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		return added.length > 0 || removed.length > 0 ? { added, removed } : undefined;
 	}
 
+	private getPlanningPlanChangeHighlights(planSnapshot: IPlanningPlanSnapshot | undefined): readonly string[] {
+		const changeSummary = this.summarizePlanningPlanChanges(planSnapshot);
+		if (!changeSummary) {
+			return [];
+		}
+
+		return [...changeSummary.added, ...changeSummary.removed].slice(0, 4);
+	}
+
 	private buildPlanningPlanReviewContent(
 		reviewKind: 'task-decomposition' | 'plan-focus-intake' | 'plan-focus-questions',
 		planSnapshot: IPlanningPlanSnapshot | undefined,
@@ -3055,10 +3064,16 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				));
 		} else if (reviewKind === 'plan-focus-intake') {
 			markdown.appendMarkdown('$(git-commit) ');
-			markdown.appendMarkdown(localize(
-				'chat.planReview.planFocusIntake',
-				'**Updated plan ready**\n\nReview this revision and what changed, then choose the next part to sharpen or start implementation.'
-			));
+			markdown.appendMarkdown(focusAreaLabel
+				? localize(
+					'chat.planReview.planFocusIntake.withFocusArea',
+					'**Updated plan ready**\n\nThis revision sharpened **{0}**. Review what changed, then choose the next part to refine or start implementation.',
+					focusAreaLabel
+				)
+				: localize(
+					'chat.planReview.planFocusIntake',
+					'**Updated plan ready**\n\nReview this revision and what changed, then choose the next part to sharpen or start implementation.'
+				));
 		} else {
 			markdown.appendMarkdown('$(target) ');
 			markdown.appendMarkdown(focusAreaLabel
@@ -3181,12 +3196,37 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		];
 	}
 
-	private buildPlanFocusPromptDescription(options: NonNullable<IChatQuestion['options']>, planningContext: IPlanningTransitionContext | undefined): string {
+	private buildPlanFocusPromptDescription(
+		options: NonNullable<IChatQuestion['options']>,
+		planningContext: IPlanningTransitionContext | undefined,
+		planSnapshot: IPlanningPlanSnapshot | undefined,
+		lastFocusAreaLabel?: string,
+	): string {
 		const primaryArtifact = this.getUserFacingPlanningArtifactLabel(planningContext?.repositoryContext);
+		const changeHighlights = this.getPlanningPlanChangeHighlights(planSnapshot)
+			.map(highlight => this.summarizePlanFocusOptionLabel(highlight))
+			.slice(0, 2);
 		const focusableAreas = options
 			.filter(option => option.value !== 'start-implementation')
 			.map(option => option.label)
 			.slice(0, 3);
+
+		if (lastFocusAreaLabel && changeHighlights.length > 0) {
+			return localize(
+				'chat.planFocusPrompt.description.lastFocusWithChanges',
+				'Latest refinement sharpened {0}. Recent plan changes: {1}. Choose the next area, type a custom focus, or start implementation.',
+				lastFocusAreaLabel,
+				changeHighlights.join('; ')
+			);
+		}
+
+		if (lastFocusAreaLabel) {
+			return localize(
+				'chat.planFocusPrompt.description.lastFocus',
+				'Latest refinement sharpened {0}. Choose the next area to refine, type a custom focus, or start implementation.',
+				lastFocusAreaLabel
+			);
+		}
 
 		if (focusableAreas.length === 0) {
 			return primaryArtifact
@@ -3306,7 +3346,14 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		return bestScore > 0 ? bestChunk?.focusText : undefined;
 	}
 
-	private extractPlanFocusSlices(currentPlan: string | undefined, planningContext: IPlanningTransitionContext | undefined): readonly IPlanningPlanFocusSlice[] {
+	private extractPlanFocusSlices(
+		currentPlan: string | undefined,
+		planningContext: IPlanningTransitionContext | undefined,
+		options?: {
+			readonly planSnapshot?: IPlanningPlanSnapshot;
+			readonly lastFocusAreaLabel?: string;
+		}
+	): readonly IPlanningPlanFocusSlice[] {
 		const taskLens = planningContext?.repositoryContext?.taskLens;
 		const slices: IPlanningPlanFocusSlice[] = [];
 		const seen = new Set<string>();
@@ -3359,7 +3406,36 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			});
 		}
 
-		return slices.slice(0, 5);
+		const changeHighlights = this.getPlanningPlanChangeHighlights(options?.planSnapshot);
+		const lastFocusAreaLabel = options?.lastFocusAreaLabel?.trim();
+		const categoryBaseScore = (category: IPlanningPlanFocusSlice['category']): number => {
+			switch (category) {
+				case 'plan-area': return 40;
+				case 'validation': return 34;
+				case 'guardrail': return 28;
+				case 'plan-step': return 22;
+			}
+		};
+
+		return slices
+			.map((slice, index) => {
+				let score = categoryBaseScore(slice.category) - index;
+				if (lastFocusAreaLabel) {
+					score += this.computePlanFocusOverlap(lastFocusAreaLabel, slice.label) * 8;
+					score += this.computePlanFocusOverlap(lastFocusAreaLabel, slice.focusText) * 5;
+				}
+
+				for (const highlight of changeHighlights) {
+					score += this.computePlanFocusOverlap(highlight, slice.label) * 6;
+					score += this.computePlanFocusOverlap(highlight, slice.focusText) * 4;
+					score += this.computePlanFocusOverlap(highlight, slice.contextText) * 2;
+				}
+
+				return { slice, score, index };
+			})
+			.sort((left, right) => right.score - left.score || left.index - right.index)
+			.map(entry => entry.slice)
+			.slice(0, 5);
 	}
 
 	private buildPlanFocusContextHint(slice: IPlanningPlanFocusSlice): string {
@@ -3440,9 +3516,17 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		options: IChatAcceptInputOptions,
 		planningPhase: PlanningPhase,
 		planSnapshot?: IPlanningPlanSnapshot,
+		lastFocusAreaLabel?: string,
 	): void {
 		const currentSnapshot = planSnapshot ?? this.getLatestPlanningPlanSnapshot();
-		const focusSlices = this.extractPlanFocusSlices(currentSnapshot?.planText ?? this.getCurrentPlanningResponseText(), this._planningTransitionContext);
+		const focusSlices = this.extractPlanFocusSlices(
+			currentSnapshot?.planText ?? this.getCurrentPlanningResponseText(),
+			this._planningTransitionContext,
+			{
+				planSnapshot: currentSnapshot,
+				lastFocusAreaLabel,
+			}
+		);
 		const resolveId = `${planningMiddlewareQuestionCarouselResolveIdPrefix}plan-focus-intake-${Date.now()}`;
 		this._planFocusSlicesByResolveId.set(resolveId, focusSlices);
 
@@ -3453,7 +3537,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				type: 'singleSelect',
 				title: localize('chat.planFocusPrompt.title', 'What Should Happen Next?'),
 				message: localize('chat.planFocusPrompt.message', 'Choose a part of the current plan to sharpen again, or select Start Implementation when the plan is ready.'),
-				description: this.buildPlanFocusPromptDescription(promptOptions, this._planningTransitionContext),
+				description: this.buildPlanFocusPromptDescription(promptOptions, this._planningTransitionContext, currentSnapshot, lastFocusAreaLabel),
 				required: true,
 				allowFreeformInput: true,
 				options: promptOptions,
@@ -3480,6 +3564,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			{
 				reviewKind: 'plan-focus-intake',
 				planSnapshot: currentSnapshot,
+				focusAreaLabel: lastFocusAreaLabel,
 			}
 		);
 	}
@@ -3553,7 +3638,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			return true;
 		}
 
-		return uri.scheme === Schemas.vscodeChatInput
+		return uri.scheme === 'gutter-input'
+			|| uri.scheme === Schemas.vscodeChatInput
 			|| uri.scheme === Schemas.vscodeChatCodeBlock
 			|| uri.scheme === Schemas.vscodeChatCodeCompareBlock
 			|| uri.scheme === Schemas.vscodeChatEditor;
@@ -3818,7 +3904,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				originalQuery,
 				options,
 				generationContext.planningPhase,
-				this.capturePlanningPlanSnapshot(response)
+				this.capturePlanningPlanSnapshot(response),
+				generationContext.focusAreaLabel
 			)
 		);
 	}
