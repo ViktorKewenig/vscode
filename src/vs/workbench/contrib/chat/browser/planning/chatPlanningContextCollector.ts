@@ -764,7 +764,7 @@ function buildPlanningTaskLens(
 	const primaryArtifact = isConcretePlanningArtifactReference(primaryArtifactHint)
 		? primaryArtifactHint
 		: inferredTarget?.label
-			?? (!requestNeedsExplicitArtifact && activeResource ? basename(activeResource) : undefined);
+		?? (!requestNeedsExplicitArtifact && activeResource ? basename(activeResource) : undefined);
 	const artifactType = inferArtifactType(requestIntent, inferredTarget, primaryArtifact, selectedText, activeSymbols);
 	const desiredOutcome = extractDesiredOutcome(input, requestIntent, primaryArtifact);
 	const deliverableType = inferDeliverableType(requestIntent, input.userRequest);
