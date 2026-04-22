@@ -144,6 +144,56 @@ suite('ChatPlanningTransition', () => {
 		}]);
 	});
 
+	test('keeps the most concrete planning target and artifact when later context is broader', () => {
+		const merged = mergePlanningTransitionContexts(
+			{
+				phase: 'focused-slice',
+				answers: [{ question: 'Target File', answer: 'data/orders.csv' }],
+				repositoryContext: {
+					scope: 'focused',
+					planningTarget: { kind: 'file', label: 'data/orders.csv', confidence: 'high' },
+					primaryArtifactHint: 'data/orders.csv',
+					taskLens: {
+						taskKind: 'data-analysis',
+						primaryArtifact: 'data/orders.csv',
+					},
+					focusQueries: ['orders.csv'],
+					activeDocumentSymbols: [],
+					workspaceSymbolMatches: [],
+					nearbyFiles: ['data/schema.json'],
+					relevantSnippets: [],
+				}
+			},
+			{
+				phase: 'broad-scan',
+				answers: [{ question: 'Related Files', answer: 'schema.json' }],
+				repositoryContext: {
+					scope: 'broad',
+					planningTarget: { kind: 'workspace', label: 'workspace', confidence: 'low' },
+					primaryArtifactHint: 'Requested CSV file',
+					taskLens: {
+						taskKind: 'data-analysis',
+						primaryArtifact: 'Requested CSV file',
+					},
+					focusQueries: ['csv'],
+					activeDocumentSymbols: [],
+					workspaceSymbolMatches: [],
+					nearbyFiles: ['data/schema.json'],
+					relevantSnippets: [],
+				}
+			}
+		);
+
+		assert.deepStrictEqual(merged?.repositoryContext?.planningTarget, {
+			kind: 'file',
+			label: 'data/orders.csv',
+			confidence: 'high'
+		});
+		assert.strictEqual(merged?.repositoryContext?.primaryArtifactHint, 'data/orders.csv');
+		assert.strictEqual(merged?.repositoryContext?.taskLens?.primaryArtifact, 'data/orders.csv');
+		assert.strictEqual(merged?.repositoryContext?.scope, 'focused');
+	});
+
 	test('recognizes planning mode names', () => {
 		assert.strictEqual(isPlanningModeName('Plan'), true);
 		assert.strictEqual(isPlanningModeName('planner'), true);

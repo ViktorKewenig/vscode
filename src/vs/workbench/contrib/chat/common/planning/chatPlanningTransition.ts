@@ -650,8 +650,8 @@ function formatPlanningRequestIntent(intent: PlanningRequestIntent): string {
 			return 'Test work';
 		case 'investigation':
 			return 'Investigation';
-	default:
-		return 'General coding work';
+		default:
+			return 'General coding work';
 	}
 }
 
@@ -739,11 +739,11 @@ function mergeRepositoryContexts(
 
 	return {
 		workspaceRoot: incoming.workspaceRoot ?? base.workspaceRoot,
-		scope: incoming.scope,
-		planningTarget: incoming.planningTarget ?? base.planningTarget,
+		scope: pickNarrowerRepositoryScope(base.scope, incoming.scope),
+		planningTarget: pickBetterPlanningTarget(base.planningTarget, incoming.planningTarget),
 		requestIntent: incoming.requestIntent ?? base.requestIntent,
 		taskLens: mergePlanningTaskLens(base.taskLens, incoming.taskLens),
-		primaryArtifactHint: incoming.primaryArtifactHint ?? base.primaryArtifactHint,
+		primaryArtifactHint: pickConcretePlanningArtifact(base.primaryArtifactHint, incoming.primaryArtifactHint),
 		relatedArtifactHints: mergeOptionalStringArrays(base.relatedArtifactHints, incoming.relatedArtifactHints),
 		focusSummary: incoming.focusSummary ?? base.focusSummary,
 		focusQueries: incoming.focusQueries.length > 0
@@ -781,7 +781,7 @@ function mergePlanningTaskLens(base: IPlanningTaskLens | undefined, incoming: IP
 	return {
 		taskKind: incoming.taskKind ?? base.taskKind,
 		taskSummary: incoming.taskSummary ?? base.taskSummary,
-		primaryArtifact: incoming.primaryArtifact ?? base.primaryArtifact,
+		primaryArtifact: pickConcretePlanningArtifact(base.primaryArtifact, incoming.primaryArtifact),
 		secondaryArtifacts: mergeOptionalStringArrays(base.secondaryArtifacts, incoming.secondaryArtifacts),
 		artifactType: incoming.artifactType ?? base.artifactType,
 		desiredOutcome: incoming.desiredOutcome ?? base.desiredOutcome,
@@ -808,6 +808,58 @@ function preferIncomingStringArray(base: readonly string[] | undefined, incoming
 
 function mergeStringArrays(base: readonly string[], incoming: readonly string[]): string[] {
 	return [...base, ...incoming].filter((value, index, values) => values.indexOf(value) === index);
+}
+
+function pickNarrowerRepositoryScope(base: PlanningRepositoryScope, incoming: PlanningRepositoryScope): PlanningRepositoryScope {
+	const scopeRank: Record<PlanningRepositoryScope, number> = {
+		broad: 0,
+		focused: 1,
+		detailed: 2,
+	};
+
+	return scopeRank[incoming] >= scopeRank[base] ? incoming : base;
+}
+
+function pickConcretePlanningArtifact(base: string | undefined, incoming: string | undefined): string | undefined {
+	if (isConcretePlanningArtifactReference(incoming)) {
+		return incoming;
+	}
+
+	if (isConcretePlanningArtifactReference(base)) {
+		return base;
+	}
+
+	return incoming ?? base;
+}
+
+function pickBetterPlanningTarget(base: IPlanningTarget | undefined, incoming: IPlanningTarget | undefined): IPlanningTarget | undefined {
+	if (!base) {
+		return incoming;
+	}
+
+	if (!incoming) {
+		return base;
+	}
+
+	const confidenceRank: Record<PlanningTargetConfidence, number> = {
+		low: 0,
+		medium: 1,
+		high: 2,
+	};
+	const kindRank: Record<PlanningTargetKind, number> = {
+		workspace: 0,
+		folder: 1,
+		'working-set': 2,
+		file: 3,
+		selection: 4,
+	};
+	const baseConfidence = confidenceRank[base.confidence ?? 'low'];
+	const incomingConfidence = confidenceRank[incoming.confidence ?? 'low'];
+	if (incomingConfidence !== baseConfidence) {
+		return incomingConfidence > baseConfidence ? incoming : base;
+	}
+
+	return kindRank[incoming.kind] >= kindRank[base.kind] ? incoming : base;
 }
 
 function formatPlanningTarget(target: IPlanningTarget): string {

@@ -69,6 +69,7 @@ import { ChatEditorInput, showClearEditingSessionConfirmation } from '../widgetH
 import { convertBufferToScreenshotVariable } from '../attachments/chatScreenshotContext.js';
 import { getChatSessionType, LocalChatSessionUri } from '../../common/model/chatUri.js';
 import { localChatSessionType } from '../../common/chatSessionsService.js';
+import { extractPlanningPlanText, summarizePlanningPlanChanges } from '../planning/chatPlanningPlanText.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { ChatViewPane } from '../widgetHosts/viewPane/chatViewPane.js';
 
@@ -1612,8 +1613,32 @@ export function registerChatActions() {
 
 	function getPlanningPlanText(chatService: IChatService, sessionResource: URI, requestId: string): string | undefined {
 		const request = chatService.getSession(sessionResource)?.getRequests().find(candidate => candidate.id === requestId);
-		const planText = request?.response?.response.toString().trim();
-		return planText ? planText : undefined;
+		return extractPlanningPlanText(request?.response?.response);
+	}
+
+	function buildPlanningPlanEditorContents(currentPlanText: string, previousPlanText: string | undefined): string {
+		const changeSummary = summarizePlanningPlanChanges(previousPlanText, currentPlanText);
+		if (!changeSummary) {
+			return currentPlanText;
+		}
+
+		const diffLines = [
+			...changeSummary.added.map(line => `+ ${line}`),
+			...changeSummary.removed.map(line => `- ${line}`),
+		];
+
+		return [
+			'# Planning Plan',
+			'',
+			'## Changes in This Revision',
+			'```diff',
+			...diffLines,
+			'```',
+			'',
+			'## Current Plan',
+			'',
+			currentPlanText,
+		].join('\n');
 	}
 
 	function createPlanningPlanEditorInput(title: string, requestId: string, contents: string): IUntitledTextResourceEditorInput {
@@ -1647,13 +1672,14 @@ export function registerChatActions() {
 			const notificationService = accessor.get(INotificationService);
 			const sessionResource = revivePlanningSessionResource(args.sessionResource);
 			const planText = getPlanningPlanText(chatService, sessionResource, args.requestId);
+			const previousPlanText = args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined;
 			if (!planText) {
 				notificationService.warn(localize('openPlanningPlan.missing', 'The selected plan is no longer available in this chat session.'));
 				return;
 			}
 
 			await editorService.openEditor({
-				...createPlanningPlanEditorInput(localize('openPlanningPlan.editorTitle', 'Planning Plan'), args.requestId, planText),
+				...createPlanningPlanEditorInput(localize('openPlanningPlan.editorTitle', 'Planning Plan'), args.requestId, buildPlanningPlanEditorContents(planText, previousPlanText)),
 				options: { pinned: true },
 			}, ACTIVE_GROUP);
 		}
@@ -1679,13 +1705,14 @@ export function registerChatActions() {
 			const notificationService = accessor.get(INotificationService);
 			const sessionResource = revivePlanningSessionResource(args.sessionResource);
 			const planText = getPlanningPlanText(chatService, sessionResource, args.requestId);
+			const previousPlanText = args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined;
 			if (!planText) {
 				notificationService.warn(localize('openPlanningPlanToSide.missing', 'The selected plan is no longer available in this chat session.'));
 				return;
 			}
 
 			await editorService.openEditor({
-				...createPlanningPlanEditorInput(localize('openPlanningPlanToSide.editorTitle', 'Planning Plan'), args.requestId, planText),
+				...createPlanningPlanEditorInput(localize('openPlanningPlanToSide.editorTitle', 'Planning Plan'), args.requestId, buildPlanningPlanEditorContents(planText, previousPlanText)),
 				options: { pinned: true },
 			}, SIDE_GROUP);
 		}

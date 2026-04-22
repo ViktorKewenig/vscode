@@ -96,7 +96,8 @@ import { IAgentSessionsService } from '../agentSessions/agentSessionsService.js'
 import { IChatDebugService } from '../../common/chatDebugService.js';
 import { ChatQuestionCarouselData } from '../../common/model/chatProgressTypes/chatQuestionCarouselData.js';
 import { collectPlanningRepositoryContext } from '../planning/chatPlanningContextCollector.js';
-import { generateDynamicPlanningQuestions, IPlanningQuestionGenerationContext } from '../planning/chatPlanningQuestionGenerator.js';
+import { extractPlanningPlanText, normalizePlanningPlanLine, summarizePlanningPlanChanges } from '../planning/chatPlanningPlanText.js';
+import { generateDynamicPlanningQuestionsResult, IPlanningQuestionGenerationContext } from '../planning/chatPlanningQuestionGenerator.js';
 
 const $ = dom.$;
 
@@ -300,6 +301,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 	private recentlyRestoredCheckpoint: boolean = false;
 	private _planningPhase: PlanningPhase = 'broad-scan';
 	private _planningTransitionContext: IPlanningTransitionContext | undefined;
+	private _lastPlanningQuestionModelId: string | undefined;
 	private _lastPlanningQuestionSourceInput: string | undefined;
 	private _pendingPlanningQuestionResolveId: string | undefined;
 	private _pendingPlanningPlaceholderRequestId: string | undefined;
@@ -359,6 +361,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		if (!isEqual(previousSessionResource, viewModel?.sessionResource)) {
 			this._planningPhase = 'broad-scan';
 			this._planningTransitionContext = undefined;
+			this._lastPlanningQuestionModelId = undefined;
 			this._lastPlanningQuestionSourceInput = undefined;
 			this._pendingPlanningQuestionResolveId = undefined;
 			this._pendingPlanningPlaceholderRequestId = undefined;
@@ -2426,6 +2429,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 
 		this._planningPhase = 'broad-scan';
 		this._planningTransitionContext = undefined;
+		this._lastPlanningQuestionModelId = undefined;
 		this._lastPlanningQuestionSourceInput = undefined;
 		this._pendingPlanningQuestionResolveId = undefined;
 		this._pendingPlanningPlaceholderRequestId = undefined;
@@ -2476,7 +2480,9 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				questionStage,
 				recentConversation
 			);
-			const questions = await generateDynamicPlanningQuestions(this.languageModelsService, generationContext, CancellationToken.None);
+			const generationResult = await generateDynamicPlanningQuestionsResult(this.languageModelsService, generationContext, CancellationToken.None);
+			const questions = generationResult.questions;
+			this._lastPlanningQuestionModelId = generationResult.modelId;
 			if (!questions.length) {
 				await this.showPlanningQuestionGenerationError(questionStage, new Error(localize(
 					'chat.dynamicPlanning.emptyQuestions',
@@ -2495,8 +2501,39 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			);
 			return true;
 		} catch (error) {
+			if (questionStage === 'goal-clarity' && await this.fallbackToPlannerDrivenGoalClarity(input, options, planningPhase, error)) {
+				return true;
+			}
 			await this.showPlanningQuestionGenerationError(questionStage, error);
 			return true;
+		}
+	}
+
+	private async fallbackToPlannerDrivenGoalClarity(
+		originalQuery: string,
+		options: IChatAcceptInputOptions,
+		planningPhase: PlanningPhase,
+		error: unknown,
+	): Promise<boolean> {
+		this.logService.warn('[Planning] Goal clarity middleware failed, falling back to planner-driven follow-up.', error);
+		const planningContext = this.getPlanningTransitionContextForCurrentResponse() ?? this._planningTransitionContext;
+		try {
+			await this.submitPlanningRequestWithContext(
+				originalQuery,
+				options,
+				planningContext,
+				true,
+				async response => this.showTaskDecompositionPlanningQuestions(
+					originalQuery,
+					options,
+					planningPhase,
+					this.capturePlanningPlanSnapshot(response)
+				)
+			);
+			return true;
+		} catch (fallbackError) {
+			this.logService.error('[Planning] Planner-driven goal clarity fallback failed.', fallbackError);
+			return false;
 		}
 	}
 
@@ -2606,7 +2643,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 
 		return {
 			userRequest: input,
-			modelId: this.input.currentLanguageModel,
+			modelId: this.resolvePlanningQuestionModelId(questionStage),
 			planningPhase,
 			questionStage,
 			questionCount: stageReadiness.questionCount,
@@ -2623,6 +2660,23 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			focusAreaLabel: overrides?.focusAreaLabel?.trim(),
 			focusHint: this.buildPlanningFocusHint(questionStage, repositoryContext, currentPlan, overrides?.focusAreaLabel, overrides?.focusHint),
 		};
+	}
+
+	private resolvePlanningQuestionModelId(questionStage: PlanningQuestionStage): string | undefined {
+		const currentModelId = this.input.currentLanguageModel;
+		if (this.isExecutablePlanningQuestionModelId(currentModelId)) {
+			return currentModelId;
+		}
+
+		if (questionStage !== 'goal-clarity' && this.isExecutablePlanningQuestionModelId(this._lastPlanningQuestionModelId)) {
+			return this._lastPlanningQuestionModelId;
+		}
+
+		return currentModelId;
+	}
+
+	private isExecutablePlanningQuestionModelId(modelId: string | undefined): modelId is string {
+		return !!modelId && modelId !== 'copilot/auto';
 	}
 
 	private getCurrentPlanningInput(): string {
@@ -2648,7 +2702,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				if (item.requestId === this._pendingPlanningPlaceholderRequestId || item.isCompleteAddedRequest) {
 					continue;
 				}
-				const responseText = item.response.toString().replace(/\s+/g, ' ').trim();
+				const responseText = (extractPlanningPlanText(item.response) ?? item.response.getMarkdown() ?? item.response.toString()).replace(/\s+/g, ' ').trim();
 				if (responseText) {
 					entries.push(`Assistant: ${responseText.slice(0, 400)}`);
 				}
@@ -2664,7 +2718,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		}
 
 		const request = this.chatService.getSession(this.viewModel.sessionResource)?.getRequests().find(candidate => candidate.id === requestId);
-		const planText = request?.response?.response.toString().trim();
+		const planText = extractPlanningPlanText(request?.response?.response);
 		return planText ? planText.slice(0, 12000) : undefined;
 	}
 
@@ -2673,7 +2727,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			return undefined;
 		}
 
-		const planText = response.response.toString().trim();
+		const planText = extractPlanningPlanText(response.response);
 		if (!planText) {
 			return undefined;
 		}
@@ -2710,7 +2764,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 
 	private getCurrentPlanningResponseText(): string | undefined {
 		return this.getLatestPlanningPlanSnapshot()?.planText
-			?? this.getLatestPlanningResponseModel()?.response.toString().trim().slice(0, 12000);
+			?? extractPlanningPlanText(this.getLatestPlanningResponseModel()?.response)?.slice(0, 12000);
 	}
 
 	private getPlanningContextEditors(): ICodeEditor[] {
@@ -2755,7 +2809,10 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			};
 		}
 
-		return readiness.taskDecomposition;
+		return {
+			...readiness.taskDecomposition,
+			questionCount: Math.max(readiness.taskDecomposition.questionCount, 3),
+		};
 	}
 
 	private buildPlanningFocusHint(
@@ -2863,7 +2920,9 @@ export class ChatWidget extends Disposable implements IChatWidget {
 
 		const runCallback = () => {
 			this._pendingPlanningResponseListener.clear();
-			void callback(response);
+			void callback(response).catch(error => {
+				this.logService.error('[Planning] Failed to render planning follow-up UI', error);
+			});
 		};
 
 		if (response.isComplete) {
@@ -2987,55 +3046,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		};
 	}
 
-	private normalizePlanningPlanLine(line: string): string | undefined {
-		const normalized = line
-			.replace(/^\s{0,3}(?:[-*+]|\d+[.)]|#{1,6})\s*/, '')
-			.replace(/\s+/g, ' ')
-			.trim();
-		return normalized.length >= 12 ? normalized : undefined;
-	}
-
-	private getPlanningPlanLines(planText: string | undefined): string[] {
-		if (!planText) {
-			return [];
-		}
-
-		const lines: string[] = [];
-		const seen = new Set<string>();
-		for (const rawLine of planText.split(/\r?\n/g)) {
-			const normalized = this.normalizePlanningPlanLine(rawLine);
-			if (!normalized) {
-				continue;
-			}
-
-			const key = normalized.toLowerCase();
-			if (seen.has(key)) {
-				continue;
-			}
-
-			seen.add(key);
-			lines.push(normalized);
-		}
-
-		return lines;
-	}
-
-	private summarizePlanningPlanChanges(planSnapshot: IPlanningPlanSnapshot | undefined): { readonly added: readonly string[]; readonly removed: readonly string[] } | undefined {
-		if (!planSnapshot?.previousPlanText) {
-			return undefined;
-		}
-
-		const previousLines = this.getPlanningPlanLines(planSnapshot.previousPlanText);
-		const currentLines = this.getPlanningPlanLines(planSnapshot.planText);
-		const previousKeys = new Set(previousLines.map(line => line.toLowerCase()));
-		const currentKeys = new Set(currentLines.map(line => line.toLowerCase()));
-		const added = currentLines.filter(line => !previousKeys.has(line.toLowerCase())).slice(0, 3);
-		const removed = previousLines.filter(line => !currentKeys.has(line.toLowerCase())).slice(0, 2);
-		return added.length > 0 || removed.length > 0 ? { added, removed } : undefined;
-	}
-
 	private getPlanningPlanChangeHighlights(planSnapshot: IPlanningPlanSnapshot | undefined): readonly string[] {
-		const changeSummary = this.summarizePlanningPlanChanges(planSnapshot);
+		const changeSummary = summarizePlanningPlanChanges(planSnapshot?.previousPlanText, planSnapshot?.planText);
 		if (!changeSummary) {
 			return [];
 		}
@@ -3088,7 +3100,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				));
 		}
 
-		const changeSummary = this.summarizePlanningPlanChanges(planSnapshot);
+		const changeSummary = summarizePlanningPlanChanges(planSnapshot?.previousPlanText, planSnapshot?.planText);
 		if (changeSummary) {
 			markdown.appendMarkdown(localize('chat.planReview.changeSummaryHeading', '\n\n**What Changed In This Revision**'));
 			for (const added of changeSummary.added) {
@@ -3165,7 +3177,9 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			);
 			this._planningTransitionContext = refreshedPlanningContext;
 
-			const questions = await generateDynamicPlanningQuestions(this.languageModelsService, generationContext, CancellationToken.None);
+			const generationResult = await generateDynamicPlanningQuestionsResult(this.languageModelsService, generationContext, CancellationToken.None);
+			const questions = generationResult.questions;
+			this._lastPlanningQuestionModelId = generationResult.modelId;
 			await this.clearPendingPlanningPlaceholder();
 			if (!questions.length) {
 				await this.showPlanningQuestionGenerationError('task-decomposition', new Error(localize(
@@ -3301,7 +3315,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				return;
 			}
 
-			const label = this.normalizePlanningPlanLine(currentChunk[0]);
+			const label = normalizePlanningPlanLine(currentChunk[0]);
 			const focusText = currentChunk.join('\n').trim();
 			if (label && focusText) {
 				chunks.push({ label: this.summarizePlanFocusOptionLabel(label), focusText });
@@ -3617,7 +3631,9 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			);
 			this._planningTransitionContext = refreshedPlanningContext;
 
-			const questions = await generateDynamicPlanningQuestions(this.languageModelsService, generationContext, CancellationToken.None);
+			const generationResult = await generateDynamicPlanningQuestionsResult(this.languageModelsService, generationContext, CancellationToken.None);
+			const questions = generationResult.questions;
+			this._lastPlanningQuestionModelId = generationResult.modelId;
 			await this.clearPendingPlanningPlaceholder();
 			if (!questions.length) {
 				await this.showPlanningQuestionGenerationError('plan-focus', new Error(localize(

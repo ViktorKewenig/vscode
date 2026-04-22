@@ -51,11 +51,28 @@ interface IGeneratedPlanningQuestionEnvelope {
 	readonly questions?: ReadonlyArray<IGeneratedPlanningQuestion>;
 }
 
+export interface IGeneratedPlanningQuestionsResult {
+	readonly questions: IChatQuestion[];
+	readonly modelId: string;
+}
+
+const preferredPlanningDefaultModelFamilies = ['gpt-4.1'];
+const planningModelRegistrationPollMs = 1000;
+const planningModelRegistrationMaxWaitMs = 8000;
+
 export async function generateDynamicPlanningQuestions(
 	languageModelsService: ILanguageModelsService,
 	context: IPlanningQuestionGenerationContext,
 	token: CancellationToken
 ): Promise<IChatQuestion[]> {
+	return (await generateDynamicPlanningQuestionsResult(languageModelsService, context, token)).questions;
+}
+
+export async function generateDynamicPlanningQuestionsResult(
+	languageModelsService: ILanguageModelsService,
+	context: IPlanningQuestionGenerationContext,
+	token: CancellationToken
+): Promise<IGeneratedPlanningQuestionsResult> {
 	const requestedQuestionCount = clampRequestedQuestionCount(context.questionCount);
 	const prompt = buildPlanningQuestionPrompt(context, requestedQuestionCount);
 	const messages: IChatMessage[] = [
@@ -84,7 +101,9 @@ export async function generateDynamicPlanningQuestions(
 					'Only include a description when it genuinely helps the user answer faster.',
 					'If the stage is goal-clarity, focus on desired outcome, constraints, definition of done, and what should be in or out of scope before the first plan is built.',
 					'If the stage is task-decomposition, assume the first plan already exists and focus on tightening the work breakdown, insertion points, sequencing, validation, and repo slice for the rebuild.',
+					'If the current plan already names files, directories, symbols, dependencies, or validation targets, make your task-decomposition questions explicitly reference those concrete plan slices.',
 					'If the stage is plan-focus, assume a rebuilt plan already exists and focus on sharpening one specific aspect of that plan rather than reopening the whole request.',
+					'If the stage is plan-focus, use the selected plan slice and latest plan text as the source of truth. Your questions should feel like a zoom-in on that exact slice, not generic follow-up.',
 					'If the stage is task-decomposition or plan-focus, treat prior goal-clarity answers as settled inputs, not new question topics.',
 					'Never ask task-decomposition or plan-focus questions that re-open goal, scope, non-goals, or definition-of-done themes.',
 					'When the current workspace is already clear, do not ask which repository or workspace to use. Ask about the file, directory, subsystem, or related artifacts inside it instead.',
@@ -150,7 +169,7 @@ export async function generateDynamicPlanningQuestions(
 					: [];
 				const finalized = finalizeGeneratedQuestions(normalized, context);
 				if (finalized.length > 0) {
-					return finalized;
+					return { questions: finalized, modelId };
 				}
 
 				lastError = new Error(localize(
@@ -230,6 +249,13 @@ async function getProviderBackedModelIds(languageModelsService: ILanguageModelsS
 	const result = new Set<string>();
 	const preferredMetadata = preferredModelId ? languageModelsService.lookupLanguageModel(preferredModelId) : undefined;
 	const preferredVendor = preferredMetadata?.vendor;
+	const shouldPreferPlanningDefault = !preferredModelId || !isExecutablePlanningModelId(preferredModelId) || !preferredMetadata;
+
+	if (shouldPreferPlanningDefault) {
+		for (const modelId of await getPreferredPlanningDefaultModelIds(languageModelsService)) {
+			result.add(modelId);
+		}
+	}
 
 	if (preferredVendor && preferredMetadata?.id) {
 		for (const modelId of await languageModelsService.selectLanguageModels({
@@ -261,20 +287,68 @@ async function getProviderBackedModelIds(languageModelsService: ILanguageModelsS
 	return [...result];
 }
 
+async function getPreferredPlanningDefaultModelIds(languageModelsService: ILanguageModelsService): Promise<string[]> {
+	const result = new Set<string>();
+	const pushModelId = (modelId: string) => {
+		if (isExecutablePlanningModelId(modelId)) {
+			result.add(modelId);
+		}
+	};
+
+	for (const family of preferredPlanningDefaultModelFamilies) {
+		for (const modelId of await languageModelsService.selectLanguageModels({ id: family })) {
+			pushModelId(modelId);
+		}
+		for (const modelId of await languageModelsService.selectLanguageModels({ family })) {
+			pushModelId(modelId);
+		}
+	}
+
+	for (const modelId of languageModelsService.getLanguageModelIds()) {
+		if (isPreferredPlanningDefaultModel(languageModelsService.lookupLanguageModel(modelId))) {
+			pushModelId(modelId);
+		}
+	}
+
+	return [...result];
+}
+
+function isPreferredPlanningDefaultModel(metadata: ReturnType<ILanguageModelsService['lookupLanguageModel']>): boolean {
+	if (!metadata) {
+		return false;
+	}
+
+	const normalizedId = metadata.id?.toLowerCase();
+	const normalizedFamily = metadata.family?.toLowerCase();
+	return preferredPlanningDefaultModelFamilies.some(family =>
+		normalizedId === family
+		|| normalizedId?.startsWith(`${family}-`) === true
+		|| normalizedFamily === family
+		|| normalizedFamily?.startsWith(`${family}-`) === true
+	);
+}
+
 function isExecutablePlanningModelId(modelId: string): boolean {
 	return modelId !== 'copilot/auto';
 }
 
 function shouldWaitForLanguageModelProvider(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): boolean {
+	const hasObservableLanguageModelEvents = languageModelsService.onDidChangeLanguageModels !== Event.None
+		|| languageModelsService.onDidChangeLanguageModelVendors !== Event.None;
+	const hasRegisteredVendors = languageModelsService.getVendors().length > 0;
+	const hasExecutableModelIds = languageModelsService.getLanguageModelIds().some(modelId => isExecutablePlanningModelId(modelId));
+
 	if (!preferredModelId) {
-		return false;
+		return hasObservableLanguageModelEvents || hasRegisteredVendors || hasExecutableModelIds;
 	}
 
 	if (!isExecutablePlanningModelId(preferredModelId)) {
-		return true;
+		return hasObservableLanguageModelEvents || hasRegisteredVendors || hasExecutableModelIds;
 	}
 
-	return !!languageModelsService.lookupLanguageModel(preferredModelId)?.vendor;
+	return !!languageModelsService.lookupLanguageModel(preferredModelId)?.vendor
+		|| hasObservableLanguageModelEvents
+		|| hasRegisteredVendors;
 }
 
 function isMissingChatProviderError(error: Error | undefined): boolean {
@@ -287,9 +361,31 @@ async function waitForLanguageModelRegistration(
 	token: CancellationToken,
 ): Promise<boolean> {
 	const preferredVendor = preferredModelId ? languageModelsService.lookupLanguageModel(preferredModelId)?.vendor : undefined;
-	const changeEvent = preferredVendor
+	const deadline = Date.now() + planningModelRegistrationMaxWaitMs;
+	while (!token.isCancellationRequested && Date.now() < deadline) {
+		const changed = await waitForLanguageModelChange(languageModelsService, preferredVendor, token, Math.min(planningModelRegistrationPollMs, Math.max(deadline - Date.now(), 0)));
+		if (changed) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+async function waitForLanguageModelChange(
+	languageModelsService: ILanguageModelsService,
+	preferredVendor: string | undefined,
+	token: CancellationToken,
+	timeoutMs: number,
+): Promise<boolean> {
+	const vendorChangeEvent = preferredVendor
+		? Event.filter(languageModelsService.onDidChangeLanguageModelVendors, vendors => vendors.includes(preferredVendor))
+		: languageModelsService.onDidChangeLanguageModelVendors;
+	const modelChangeEvent = preferredVendor
 		? Event.filter(languageModelsService.onDidChangeLanguageModels, vendor => vendor === preferredVendor)
 		: languageModelsService.onDidChangeLanguageModels;
+	const changeEvent = Event.any(vendorChangeEvent, modelChangeEvent);
+
 	return new Promise<boolean>(resolve => {
 		let done = false;
 		const finish = (changed: boolean) => {
@@ -302,13 +398,9 @@ async function waitForLanguageModelRegistration(
 			cancellationListener.dispose();
 			resolve(changed);
 		};
-		const listener = changeEvent(() => {
-			finish(true);
-		});
-		const timer = timeout(1500);
-		timer.then(() => {
-			finish(false);
-		});
+		const listener = changeEvent(() => finish(true));
+		const timer = timeout(timeoutMs);
+		timer.then(() => finish(false));
 		const cancellationListener = token.onCancellationRequested(() => finish(false));
 	});
 }
@@ -348,6 +440,11 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 
 	if (context.currentPlan) {
 		sections.push(`Current plan:\n${truncate(context.currentPlan, 1800)}`);
+	}
+
+	const planAnchors = extractPlanAnchors(context.currentPlan);
+	if (planAnchors.length > 0) {
+		sections.push(`Current plan anchors:\n${planAnchors.map(anchor => `- ${anchor}`).join('\n')}`);
 	}
 
 	if (context.planningAnswers.length > 0) {
@@ -390,12 +487,12 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 		context.questionStage === 'goal-clarity'
 			? `Return exactly ${requestedQuestionCount} questions that clarify the implementation goal, constraints, non-goals, and what success looks like before the first plan is built.`
 			: context.questionStage === 'task-decomposition'
-				? `Return exactly ${requestedQuestionCount} questions that tighten the first plan into a stronger work breakdown, insertion-point choice, repo slice, and validation path.`
+				? `Return exactly ${requestedQuestionCount} questions that tighten the first plan into a stronger work breakdown, insertion-point choice, repo slice, and validation path. At least two questions should hook into concrete files, steps, dependencies, or validation targets already named in the current plan or task lens.`
 				: `Return exactly ${requestedQuestionCount} questions that zoom in on one specific aspect of the rebuilt plan using the named focus area, the latest plan text, and the narrowed repo context.`,
 		context.questionStage === 'goal-clarity'
 			? 'Prefer a light but engaging pre-planning UX: the questions should feel closer to ask-questions than a heavy middleware banner.'
 			: context.questionStage === 'task-decomposition'
-				? 'Prefer a concrete refinement UX: one question should usually lock in work breakdown, insertion point, or validation.'
+				? 'Prefer a concrete refinement UX: one question should usually lock in work breakdown, insertion point, file or repo slice, or validation.'
 				: 'Prefer a focused refinement UX: the questions should feel like a zoom-in on one part of the plan, not a restart of the whole plan. When possible, cover the exact repo slice, the key unresolved decision, and the evidence or validation needed for that focused change.',
 		'Avoid generic project-management questions.',
 		'Do not ask for information that is already clear from the repo context, current plan, or earlier answers.',
@@ -535,6 +632,45 @@ function normalizeText(value: string | undefined): string | undefined {
 
 function truncate(value: string, maxLength: number): string {
 	return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
+}
+
+function extractPlanAnchors(currentPlan: string | undefined): string[] {
+	if (!currentPlan) {
+		return [];
+	}
+
+	const anchors: string[] = [];
+	const seen = new Set<string>();
+	for (const rawLine of currentPlan.split(/\r?\n/g)) {
+		const normalized = rawLine
+			.replace(/^\s{0,3}(?:[-*+]|\d+[.)]|#{1,6})\s*/, '')
+			.replace(/\s+/g, ' ')
+			.trim();
+		if (normalized.length < 12) {
+			continue;
+		}
+
+		const key = normalized.toLowerCase();
+		if (seen.has(key)) {
+			continue;
+		}
+
+		seen.add(key);
+		anchors.push(normalized);
+		if (anchors.length >= 6) {
+			break;
+		}
+	}
+
+	return anchors;
+}
+
+function extractFileLikeMentions(value: string | undefined): string[] {
+	if (!value) {
+		return [];
+	}
+
+	return value.match(/(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g) ?? [];
 }
 
 function finalizeGeneratedQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
@@ -704,6 +840,8 @@ function scoreQuestionForContext(question: IChatQuestion, context: IPlanningQues
 	}
 
 	const taskLens = context.repositoryContext?.taskLens;
+	const planAnchors = extractPlanAnchors(context.currentPlan);
+	const planFileMentions = extractFileLikeMentions(context.currentPlan);
 	const hasConcretePrimaryArtifact = isConcretePlanningArtifactReference(taskLens?.primaryArtifact)
 		|| isConcretePlanningArtifactReference(context.repositoryContext?.primaryArtifactHint);
 	const hasUnresolvedPrimaryArtifact = !hasConcretePrimaryArtifact && !!context.repositoryContext?.primaryArtifactHint;
@@ -721,12 +859,14 @@ function scoreQuestionForContext(question: IChatQuestion, context: IPlanningQues
 		+ keywordOverlap(taskLens?.desiredOutcome, 2.2)
 		+ keywordOverlap(taskLens?.primaryArtifact ?? context.repositoryContext?.primaryArtifactHint, 2.4)
 		+ overlap(taskLens?.secondaryArtifacts ?? context.repositoryContext?.relatedArtifactHints, 1.5)
-		+ overlap(taskLens?.planAreas, context.questionStage === 'goal-clarity' ? 0.7 : 1.8)
+		+ overlap(taskLens?.planAreas, context.questionStage === 'goal-clarity' ? 0.7 : 2.4)
 		+ overlap(taskLens?.validationTargets, 1.6)
 		+ overlap(taskLens?.riskAreas, 1.5)
 		+ overlap(taskLens?.unknowns, 2)
 		+ keywordOverlap(context.focusAreaLabel, context.questionStage === 'plan-focus' ? 2.6 : 0.8)
-		+ keywordOverlap(context.currentPlan, context.questionStage === 'goal-clarity' ? 0.4 : 1.1);
+		+ keywordOverlap(context.currentPlan, context.questionStage === 'goal-clarity' ? 0.4 : 1.8)
+		+ overlap(planAnchors, context.questionStage === 'goal-clarity' ? 0.4 : context.questionStage === 'task-decomposition' ? 2.8 : 3)
+		+ overlap(planFileMentions, context.questionStage === 'goal-clarity' ? 0.5 : 2.6);
 
 	if (context.questionStage === 'task-decomposition' && question.type !== 'text') {
 		score += 0.35;
@@ -734,6 +874,22 @@ function scoreQuestionForContext(question: IChatQuestion, context: IPlanningQues
 
 	if (context.questionStage === 'plan-focus' && question.type === 'text') {
 		score += 0.25;
+	}
+
+	if (context.questionStage === 'task-decomposition' && planAnchors.length > 0) {
+		if (computeOverlap(prompt, planAnchors.join(' ')) === 0 && computeOverlap(prompt, planFileMentions.join(' ')) === 0) {
+			score -= 1.8;
+		}
+
+		if (/\b(anything else|other context|additional context|other preferences|anything to keep in mind)\b/i.test(prompt)) {
+			score -= 2.4;
+		}
+	}
+
+	if (context.questionStage === 'plan-focus' && context.focusAreaLabel) {
+		if (computeOverlap(prompt, normalizeWhitespace(context.focusAreaLabel)) === 0 && computeOverlap(prompt, planAnchors.join(' ')) === 0) {
+			score -= 2.2;
+		}
 	}
 
 	if ((context.repositoryContext?.workspaceRoot || context.repositoryContext?.workspaceFolders?.length === 1)
