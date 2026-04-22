@@ -255,7 +255,7 @@ function isUsablePlanningResource(resource: URI, workspaceFolders: readonly IWor
 	}
 
 	if (resource.scheme === Schemas.untitled || resource.scheme === Schemas.vscodeNotebookCell) {
-		return true;
+		return false;
 	}
 
 	return workspaceFolders.some(folder => extUri.isEqualOrParent(resource, folder.uri));
@@ -1712,7 +1712,10 @@ function resolvePreviousPlanningResource(previousRepositoryContext: IPlanningRep
 	const targetResource = previousRepositoryContext?.planningTarget?.resource;
 	if (targetResource && (previousRepositoryContext?.planningTarget?.kind === 'file' || previousRepositoryContext?.planningTarget?.kind === 'selection')) {
 		try {
-			return URI.parse(targetResource);
+			const resource = URI.parse(targetResource);
+			if (isUsablePlanningResource(resource, workspaceFolders)) {
+				return resource;
+			}
 		} catch {
 			// ignore parse failures and fall back below
 		}

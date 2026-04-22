@@ -29,6 +29,44 @@ suite('ChatPlanningPlanText', () => {
 		].join('\n'));
 	});
 
+	test('strips planning prompt scaffolding from extracted plan text', () => {
+		const response = new Response([
+			{
+				kind: 'markdownContent',
+				content: new MarkdownString([
+					'Planning context from the previous planning step:',
+					'Planning phase: focused-slice',
+					'Planning answers:',
+					'- Which file matters most?: `orders.csv`',
+					'- What should the analysis produce?: A concise markdown summary',
+					'Use this planning context as the source of truth for implementation unless the codebase forces a concrete adjustment.',
+					'',
+					'## Plan: Analyze Orders CSV',
+					'',
+					'**Steps**',
+					'1. Load `orders.csv` into pandas.',
+					'2. Validate the columns against `schema.json`.',
+					'3. Produce a concise markdown summary.',
+					'',
+					'**Verification**',
+					'1. Confirm the expected columns are present.',
+				].join('\n'))
+			}
+		]);
+
+		assert.strictEqual(extractPlanningPlanText(response), [
+			'## Plan: Analyze Orders CSV',
+			'',
+			'**Steps**',
+			'1. Load `orders.csv` into pandas.',
+			'2. Validate the columns against `schema.json`.',
+			'3. Produce a concise markdown summary.',
+			'',
+			'**Verification**',
+			'1. Confirm the expected columns are present.',
+		].join('\n'));
+	});
+
 	test('summarizes added and removed plan lines', () => {
 		const changeSummary = summarizePlanningPlanChanges(
 			[

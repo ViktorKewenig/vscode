@@ -99,6 +99,8 @@ interface IPlanningPlanCommandArgs {
 	readonly sessionResource: URI | string;
 	readonly requestId: string;
 	readonly previousRequestId?: string;
+	readonly planText?: string;
+	readonly previousPlanText?: string;
 }
 
 const defaultChat = {
@@ -1671,8 +1673,8 @@ export function registerChatActions() {
 			const editorService = accessor.get(IEditorService);
 			const notificationService = accessor.get(INotificationService);
 			const sessionResource = revivePlanningSessionResource(args.sessionResource);
-			const planText = getPlanningPlanText(chatService, sessionResource, args.requestId);
-			const previousPlanText = args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined;
+			const planText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
+			const previousPlanText = args.previousPlanText ?? (args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined);
 			if (!planText) {
 				notificationService.warn(localize('openPlanningPlan.missing', 'The selected plan is no longer available in this chat session.'));
 				return;
@@ -1704,8 +1706,8 @@ export function registerChatActions() {
 			const editorService = accessor.get(IEditorService);
 			const notificationService = accessor.get(INotificationService);
 			const sessionResource = revivePlanningSessionResource(args.sessionResource);
-			const planText = getPlanningPlanText(chatService, sessionResource, args.requestId);
-			const previousPlanText = args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined;
+			const planText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
+			const previousPlanText = args.previousPlanText ?? (args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined);
 			if (!planText) {
 				notificationService.warn(localize('openPlanningPlanToSide.missing', 'The selected plan is no longer available in this chat session.'));
 				return;
@@ -1737,8 +1739,8 @@ export function registerChatActions() {
 			const editorService = accessor.get(IEditorService);
 			const notificationService = accessor.get(INotificationService);
 			const sessionResource = revivePlanningSessionResource(args.sessionResource);
-			const previousPlanText = getPlanningPlanText(chatService, sessionResource, args.previousRequestId);
-			const currentPlanText = getPlanningPlanText(chatService, sessionResource, args.requestId);
+			const previousPlanText = args.previousPlanText ?? getPlanningPlanText(chatService, sessionResource, args.previousRequestId);
+			const currentPlanText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
 			if (!previousPlanText || !currentPlanText) {
 				notificationService.warn(localize('openPlanningPlanDiff.missing', 'The previous or current plan is no longer available in this chat session.'));
 				return;

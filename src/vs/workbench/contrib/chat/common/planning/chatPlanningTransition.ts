@@ -239,6 +239,8 @@ export function augmentPromptWithPlanningContext(basePrompt: string, context: IP
 
 	planningSections.push('Use this planning context as the source of truth for implementation unless the codebase forces a concrete adjustment.');
 	planningSections.push('Do not ignore the planning answers. Use them to shape scope, task selection, sequencing, and validation in the next plan.');
+	planningSections.push('Do not re-ask questions that the planning answers already resolved. Only ask follow-up questions if a decision is still genuinely missing or ambiguous.');
+	planningSections.push('If you ask follow-up questions while gathering more repo context for the first draft, they must be more specific than the earlier goal-clarity questions and should depend on what you just learned from the code or files you inspected.');
 	const planningBlock = ['Planning context from the previous planning step:', ...planningSections].join('\n');
 
 	return prompt ? `${prompt}\n\n${planningBlock}` : planningBlock;

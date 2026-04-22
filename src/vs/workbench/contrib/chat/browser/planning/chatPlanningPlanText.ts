@@ -12,6 +12,8 @@ export interface IPlanningPlanChangeSummary {
 
 const planHeadingPattern = /^#{1,6}\s*plan\b.*$/gim;
 const planSectionMarkerPattern = /^(?:\*\*(?:steps|relevant files|verification|decisions)\*\*|#{1,6}\s*(?:steps|verification|decisions)\b)/gim;
+const planningScaffoldingBlockHeadingPattern = /^(?:planning answers:|recent planning conversation:)\s*$/i;
+const planningScaffoldingLinePattern = /^(?:planning context from the previous planning step:|planning phase:|planner notes:|use this planning context as the source of truth\b|do not ignore the planning answers\b|do not re-ask questions\b|user request:|question stage:|requested question count:|active file:|selected text:|missing dimensions:|partial dimensions:|should confirm planning target:|repository context:|scope:|workspace root:|planning target:|request intent:|task lens:|primary artifact hint:|related artifact hints:|focus summary:|focus queries:|workspace folders:|workspace top-level entries:|working set files:|active document symbols:|workspace symbol matches:|nearby files:|relevant snippets:|task kind:|task summary:|primary artifact:|adjacent artifacts:|artifact type:|desired outcome:|expected deliverable:|plan areas:|validation targets:|risks or guardrails:|open decisions:|current plan excerpt:|selected plan slice:|internal focus guidance\b)/i;
 
 export function extractPlanningPlanText(response: IResponse | undefined): string | undefined {
 	if (!response) {
@@ -132,6 +134,9 @@ function scorePlanCandidate(candidate: string): number {
 	}
 
 	const lines = normalized.split(/\r?\n/g).map(line => line.trim()).filter(line => line.length > 0);
+	const firstPlanHeadingIndex = lines.findIndex(line => /^#{1,6}\s*plan\b/i.test(line));
+	const startsWithPlanHeading = firstPlanHeadingIndex === 0;
+	const startsWithPlanSection = /^(?:\*\*(?:steps|relevant files|verification|decisions)\*\*|#{1,6}\s*(?:steps|verification|decisions)\b)/i.test(lines[0] ?? '');
 	const numberedSteps = normalized.match(/^\s*(?:[-*]|\d+[.)])\s+/gm)?.length ?? 0;
 	const hasPlanHeading = /^#{1,6}\s*plan\b.*$/im.test(normalized);
 	const hasSteps = /^\*\*steps\*\*$/im.test(normalized) || /^#{1,6}\s*steps\b/im.test(normalized);
@@ -143,6 +148,14 @@ function scorePlanCandidate(candidate: string): number {
 	let score = 0;
 	if (hasPlanHeading) {
 		score += 18;
+	}
+	if (startsWithPlanHeading) {
+		score += 10;
+	} else if (hasPlanHeading && firstPlanHeadingIndex > 0) {
+		score -= Math.min(firstPlanHeadingIndex * 2, 8);
+	}
+	if (startsWithPlanSection) {
+		score += 4;
 	}
 	if (hasSteps) {
 		score += 10;
@@ -173,7 +186,7 @@ function normalizePlanText(value: string | undefined): string | undefined {
 		return undefined;
 	}
 
-	const normalized = value
+	const normalized = stripPlanningScaffolding(value)
 		.replace(/\r\n/g, '\n')
 		.replace(/\n{3,}/g, '\n\n')
 		.trim();
@@ -181,6 +194,51 @@ function normalizePlanText(value: string | undefined): string | undefined {
 }
 
 function isNoisyPlanningLine(line: string): boolean {
+	return /^(?:read\b|searched for\b|created memory file\b|read memory\b|wrote\b|updated\b)\b/i.test(line)
+		|| planningScaffoldingLinePattern.test(line)
+		|| planningScaffoldingBlockHeadingPattern.test(line);
+}
+
+function stripPlanningScaffolding(value: string): string {
+	const filteredLines: string[] = [];
+	let skippingPromptList = false;
+
+	for (const rawLine of value.replace(/\r\n/g, '\n').split('\n')) {
+		const trimmed = rawLine.trim();
+		if (skippingPromptList) {
+			if (!trimmed) {
+				skippingPromptList = false;
+				continue;
+			}
+
+			if (/^(?:[-*+]\s+|\d+[.)]\s+)/.test(trimmed)) {
+				continue;
+			}
+
+			skippingPromptList = false;
+		}
+
+		if (!trimmed) {
+			filteredLines.push(rawLine);
+			continue;
+		}
+
+		if (planningScaffoldingBlockHeadingPattern.test(trimmed)) {
+			skippingPromptList = true;
+			continue;
+		}
+
+		if (planningScaffoldingLinePattern.test(trimmed) || isToolTraceLine(trimmed)) {
+			continue;
+		}
+
+		filteredLines.push(rawLine);
+	}
+
+	return filteredLines.join('\n');
+}
+
+function isToolTraceLine(line: string): boolean {
 	return /^(?:read\b|searched for\b|created memory file\b|read memory\b|wrote\b|updated\b)\b/i.test(line);
 }
 

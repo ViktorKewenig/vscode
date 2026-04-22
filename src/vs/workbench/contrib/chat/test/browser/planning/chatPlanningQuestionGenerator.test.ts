@@ -587,7 +587,7 @@ suite('ChatPlanningQuestionGenerator', () => {
 		assert.ok(promptPart.value.includes('Question stage:\nplan-focus'));
 		assert.ok(promptPart.value.includes('Requested question count:\n3'));
 		assert.ok(promptPart.value.includes('Current plan:\n1. Inspect orders.csv and nearby parsing utilities.'));
-		assert.ok(promptPart.value.includes('Focus hint:\nFocus especially on the validation path around orders.csv and schema.json.'));
+		assert.ok(promptPart.value.includes('Internal focus guidance (do not quote verbatim):\nFocus especially on the validation path around orders.csv and schema.json.'));
 	});
 
 	test('treats requested artifact hints as unresolved and prefers an artifact-targeting first question', async () => {

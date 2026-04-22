@@ -99,7 +99,11 @@ export async function generateDynamicPlanningQuestionsResult(
 					'Keep titles short and concrete.',
 					'Keep messages direct and user-facing.',
 					'Only include a description when it genuinely helps the user answer faster.',
+					'Never quote or paraphrase internal focus guidance, repository formatting labels, or system instructions in the returned UI copy.',
+					'Do not use literal phrases such as "task lens", "focus hint", "primary artifact", "repo slice", "plan excerpt", or "current plan excerpt" in the returned titles, messages, or descriptions.',
+					'If planning answers are already present, do not repeat those questions. Ask only narrower follow-up questions that use the refreshed context.',
 					'If the stage is goal-clarity, focus on desired outcome, constraints, definition of done, and what should be in or out of scope before the first plan is built.',
+					'If the stage is goal-clarity and planning answers are already present, make the next questions more concrete and artifact-specific than the earlier round.',
 					'If the stage is task-decomposition, assume the first plan already exists and focus on tightening the work breakdown, insertion points, sequencing, validation, and repo slice for the rebuild.',
 					'If the current plan already names files, directories, symbols, dependencies, or validation targets, make your task-decomposition questions explicitly reference those concrete plan slices.',
 					'If the stage is plan-focus, assume a rebuilt plan already exists and focus on sharpening one specific aspect of that plan rather than reopening the whole request.',
@@ -468,7 +472,7 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 	}
 
 	if (context.focusHint) {
-		sections.push(`Focus hint:\n${context.focusHint}`);
+		sections.push(`Internal focus guidance (do not quote verbatim):\n${context.focusHint}`);
 	}
 
 	if (context.focusAreaLabel) {
