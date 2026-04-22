@@ -3002,7 +3002,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 
 	private async showPlanningProgressPlaceholder(
 		kind: 'first-plan' | 'updated-plan',
-		source: PlanningPlanProgressSource = 'goal-clarity'
+		source: PlanningPlanProgressSource = 'goal-clarity',
+		requestText: string = localize('chat.dynamicPlanning.progressRequest', 'Planning')
 	): Promise<void> {
 		if (!this.viewModel || !this.isInPlanningMode()) {
 			return;
@@ -3019,7 +3020,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 					: localize('chat.dynamicPlanning.generatingUpdatedPlan', '**Updating Plan**\n\nApplying your latest decisions and rewriting the plan.'));
 
 		await this.clearPendingPlanningPlaceholder();
-		await this.chatService.addCompleteRequest(this.viewModel.sessionResource, '', undefined, 0, {
+		await this.chatService.addCompleteRequest(this.viewModel.sessionResource, requestText, undefined, 0, {
 			message: [{
 				kind: 'markdownContent',
 				content,
@@ -3076,6 +3077,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		onResponseComplete?: (response: IChatResponseModel, planSnapshot?: IPlanningPlanSnapshot) => Promise<void>,
 		progressKind?: 'first-plan' | 'updated-plan',
 		progressSource: PlanningPlanProgressSource = 'goal-clarity',
+		reuseExistingProgressPlaceholder = false,
 	): Promise<void> {
 		this._skipDynamicPlanningQuestionsOnce = true;
 		this._pendingPlanningQuestionAnswersListener.clear();
@@ -3086,9 +3088,12 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		const shouldHideResponseDuringGeneration = hideResponseOnComplete && !allowPlannerFollowupQuestions;
 
 		try {
-			await this.clearPendingPlanningPlaceholder();
 			if (progressKind) {
-				await this.showPlanningProgressPlaceholder(progressKind, progressSource);
+				if (!reuseExistingProgressPlaceholder || !this._pendingPlanningPlaceholderRequestId) {
+					await this.showPlanningProgressPlaceholder(progressKind, progressSource, originalQuery);
+				}
+			} else {
+				await this.clearPendingPlanningPlaceholder();
 			}
 
 			const response = await this._acceptInput(
@@ -3970,7 +3975,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 			: generationContext.questionStage === 'plan-focus'
 				? 'plan-focus'
 				: 'goal-clarity';
-		await this.showPlanningProgressPlaceholder(progressKind, progressSource);
+		await this.showPlanningProgressPlaceholder(progressKind, progressSource, originalQuery);
 
 		try {
 			const { planningContext: refreshedPlanningContext } = await this.refreshPlanningTransitionContextForStage(
@@ -3995,7 +4000,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						planSnapshot
 					),
 					'first-plan',
-					'goal-clarity'
+					'goal-clarity',
+					true
 				);
 				return;
 			}
@@ -4013,7 +4019,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						planSnapshot
 					),
 					'updated-plan',
-					'task-decomposition'
+					'task-decomposition',
+					true
 				);
 				return;
 			}
@@ -4031,7 +4038,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 					generationContext.focusAreaLabel
 				),
 				'updated-plan',
-				'plan-focus'
+				'plan-focus',
+				true
 			);
 		} catch (error) {
 			await this.clearPendingPlanningPlaceholder();
