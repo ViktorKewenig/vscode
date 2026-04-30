@@ -76,7 +76,7 @@ import { ComputeAutomaticInstructions } from '../../common/promptSyntax/computeA
 import { IHandOff, PromptHeader } from '../../common/promptSyntax/promptFileParser.js';
 import { assessPlanningReadiness } from '../../common/planning/chatPlanningReadiness.js';
 import { shouldRegeneratePlanningQuestions } from '../../common/planning/chatPlanningQuestionHeuristics.js';
-import { augmentPromptWithPlanningContext, buildPlanningTransitionContext, getNextPlanningPhase, getPreviousPlanningPhase, IPlanningTransitionContext, isConcretePlanningArtifactReference, isPlanningMiddlewareQuestionCarousel, isPlanningModeName, mergePlanningTransitionContexts, PlanningPhase, PlanningQuestionStage, planningMiddlewareQuestionCarouselResolveIdPrefix } from '../../common/planning/chatPlanningTransition.js';
+import { augmentPromptWithPlanningContext, buildPlanningTransitionContext, getNextPlanningPhase, getPreviousPlanningPhase, IPlanningTransitionContext, isPlanningMiddlewareQuestionCarousel, isPlanningModeName, mergePlanningTransitionContexts, PlanningPhase, PlanningQuestionStage, planningMiddlewareQuestionCarouselResolveIdPrefix } from '../../common/planning/chatPlanningTransition.js';
 import { IPromptsService, PromptsStorage } from '../../common/promptSyntax/service/promptsService.js';
 import { GENERATE_AGENT_INSTRUCTIONS_COMMAND_ID, handleModeSwitch, OPEN_PLANNING_PLAN_ACTION_ID, OPEN_PLANNING_PLAN_DIFF_ACTION_ID } from '../actions/chatActions.js';
 import { ChatTreeItem, IChatAcceptInputOptions, IChatAccessibilityService, IChatCodeBlockInfo, IChatFileTreeInfo, IChatListItemRendererOptions, IChatWidget, IChatWidgetService, IChatWidgetViewContext, IChatWidgetViewModelChangeEvent, IChatWidgetViewOptions, isIChatResourceViewContext, isIChatViewViewContext } from '../chat.js';
@@ -3028,7 +3028,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		});
 
 		this._pendingPlanningPlaceholderRequestId = this.chatService.getSession(this.viewModel.sessionResource)?.getRequests().at(-1)?.id;
-		this.hidePlanningRequestPromptFromTranscript(this._pendingPlanningPlaceholderRequestId);
 	}
 
 	private async showPlanningGenerationPlaceholder(
@@ -3076,6 +3075,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		onResponseComplete?: (response: IChatResponseModel, planSnapshot?: IPlanningPlanSnapshot) => Promise<void>,
 		progressKind?: 'first-plan' | 'updated-plan',
 		progressSource: PlanningPlanProgressSource = 'goal-clarity',
+		reuseExistingProgressPlaceholder = false,
 	): Promise<void> {
 		this._skipDynamicPlanningQuestionsOnce = true;
 		this._pendingPlanningQuestionAnswersListener.clear();
@@ -3086,9 +3086,12 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		const shouldHideResponseDuringGeneration = hideResponseOnComplete && !allowPlannerFollowupQuestions;
 
 		try {
-			await this.clearPendingPlanningPlaceholder();
 			if (progressKind) {
-				await this.showPlanningProgressPlaceholder(progressKind, progressSource);
+				if (!reuseExistingProgressPlaceholder || !this._pendingPlanningPlaceholderRequestId) {
+					await this.showPlanningProgressPlaceholder(progressKind, progressSource);
+				}
+			} else {
+				await this.clearPendingPlanningPlaceholder();
 			}
 
 			const response = await this._acceptInput(
@@ -3301,67 +3304,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				value: 'start-implementation',
 			},
 		];
-	}
-
-	private buildPlanFocusPromptDescription(
-		options: NonNullable<IChatQuestion['options']>,
-		planningContext: IPlanningTransitionContext | undefined,
-		planSnapshot: IPlanningPlanSnapshot | undefined,
-		lastFocusAreaLabel?: string,
-	): string {
-		const primaryArtifact = this.getUserFacingPlanningArtifactLabel(planningContext?.repositoryContext);
-		const changeHighlights = this.getPlanningPlanChangeHighlights(planSnapshot)
-			.map(highlight => this.summarizePlanFocusOptionLabel(highlight))
-			.slice(0, 2);
-		const focusableAreas = options
-			.filter(option => option.value !== 'start-implementation')
-			.map(option => option.label)
-			.slice(0, 3);
-
-		if (lastFocusAreaLabel && changeHighlights.length > 0) {
-			return localize(
-				'chat.planFocusPrompt.description.lastFocusWithChanges',
-				'Latest refinement: {0}. Recent changes: {1}.',
-				lastFocusAreaLabel,
-				changeHighlights.join('; ')
-			);
-		}
-
-		if (lastFocusAreaLabel) {
-			return localize(
-				'chat.planFocusPrompt.description.lastFocus',
-				'Latest refinement: {0}.',
-				lastFocusAreaLabel
-			);
-		}
-
-		if (focusableAreas.length === 0) {
-			return primaryArtifact
-				? localize(
-					'chat.planFocusPrompt.description.genericWithArtifact',
-					'Type a custom focus for {0}, or start implementation.',
-					primaryArtifact
-				)
-				: localize(
-					'chat.planFocusPrompt.description.generic',
-					'Type a custom focus, or start implementation.'
-				);
-		}
-
-		if (primaryArtifact) {
-			return localize(
-				'chat.planFocusPrompt.description.areasWithArtifact',
-				'Plan areas for {0}: {1}.',
-				primaryArtifact,
-				focusableAreas.join('; ')
-			);
-		}
-
-		return localize(
-			'chat.planFocusPrompt.description.areas',
-			'Plan areas: {0}.',
-			focusableAreas.join('; ')
-		);
 	}
 
 	private getPlanFocusTokens(value: string): readonly string[] {
@@ -3644,7 +3586,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 				type: 'singleSelect',
 				title: localize('chat.planFocusPrompt.title', 'Focus'),
 				message: localize('chat.planFocusPrompt.message', 'Choose the next plan area to sharpen, or start implementation.'),
-				description: this.buildPlanFocusPromptDescription(promptOptions, this._planningTransitionContext, currentSnapshot, lastFocusAreaLabel),
 				required: true,
 				allowFreeformInput: true,
 				options: promptOptions,
@@ -3995,7 +3936,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						planSnapshot
 					),
 					'first-plan',
-					'goal-clarity'
+					'goal-clarity',
+					true
 				);
 				return;
 			}
@@ -4013,7 +3955,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 						planSnapshot
 					),
 					'updated-plan',
-					'task-decomposition'
+					'task-decomposition',
+					true
 				);
 				return;
 			}
@@ -4031,7 +3974,8 @@ export class ChatWidget extends Disposable implements IChatWidget {
 					generationContext.focusAreaLabel
 				),
 				'updated-plan',
-				'plan-focus'
+				'plan-focus',
+				true
 			);
 		} catch (error) {
 			await this.clearPendingPlanningPlaceholder();
@@ -4064,25 +4008,6 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		}
 
 		return markdown;
-	}
-
-	private getUserFacingPlanningArtifactLabel(repositoryContext: IPlanningTransitionContext['repositoryContext'] | IPlanningQuestionGenerationContext['repositoryContext']): string | undefined {
-		const taskLensArtifact = repositoryContext?.taskLens?.primaryArtifact;
-		if (isConcretePlanningArtifactReference(taskLensArtifact)) {
-			return taskLensArtifact;
-		}
-
-		const primaryArtifactHint = repositoryContext?.primaryArtifactHint;
-		if (isConcretePlanningArtifactReference(primaryArtifactHint)) {
-			return primaryArtifactHint;
-		}
-
-		const planningTargetLabel = repositoryContext?.planningTarget?.label;
-		if (isConcretePlanningArtifactReference(planningTargetLabel)) {
-			return planningTargetLabel;
-		}
-
-		return undefined;
 	}
 
 	private getPlanningSubmissionToolOverrides(baseTools?: UserSelectedTools, allowPlannerFollowupQuestions = false): UserSelectedTools {
