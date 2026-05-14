@@ -53,7 +53,7 @@ import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
 import { ModifiedFileEntryState } from '../../common/editing/chatEditingService.js';
 import { IChatModel, IChatResponseModel } from '../../common/model/chatModel.js';
 import { ChatMode, IChatMode, IChatModeService } from '../../common/chatModes.js';
-import { ElicitationState, IChatService, IChatToolInvocation } from '../../common/chatService/chatService.js';
+import { ElicitationState, IChatPlanningPlanEditorStep, IChatQuestion, IChatQuestionAnswers, IChatService, IChatToolInvocation } from '../../common/chatService/chatService.js';
 import { ISCMHistoryItemChangeRangeVariableEntry, ISCMHistoryItemChangeVariableEntry } from '../../common/attachments/chatVariableEntries.js';
 import { IChatRequestViewModel, IChatResponseViewModel, isRequestVM } from '../../common/model/chatViewModel.js';
 import { IChatWidgetHistoryService } from '../../common/widget/chatWidgetHistoryService.js';
@@ -69,9 +69,11 @@ import { ChatEditorInput, showClearEditingSessionConfirmation } from '../widgetH
 import { convertBufferToScreenshotVariable } from '../attachments/chatScreenshotContext.js';
 import { getChatSessionType, LocalChatSessionUri } from '../../common/model/chatUri.js';
 import { localChatSessionType } from '../../common/chatSessionsService.js';
-import { extractPlanningPlanText, summarizePlanningPlanChanges } from '../planning/chatPlanningPlanText.js';
+import { extractPlanningPlanSteps, extractPlanningPlanText, IPlanningPlanStep, summarizePlanningPlanChanges } from '../planning/chatPlanningPlanText.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { ChatViewPane } from '../widgetHosts/viewPane/chatViewPane.js';
+import { IWebviewWorkbenchService } from '../../../webviewPanel/browser/webviewWorkbenchService.js';
+import { WebviewContentPurpose } from '../../../webview/browser/webview.js';
 
 export const CHAT_CATEGORY = localize2('chat.category', 'Chat');
 
@@ -94,6 +96,7 @@ export const INSERT_TROUBLESHOOT_COMMAND_ID = 'workbench.action.chat.insertTroub
 export const OPEN_PLANNING_PLAN_ACTION_ID = 'workbench.action.chat.openPlanningPlan';
 export const OPEN_PLANNING_PLAN_TO_SIDE_ACTION_ID = 'workbench.action.chat.openPlanningPlanToSide';
 export const OPEN_PLANNING_PLAN_DIFF_ACTION_ID = 'workbench.action.chat.openPlanningPlanDiff';
+const PLANNING_PLAN_WEBVIEW_VIEW_TYPE = 'workbench.chat.planningPlanEditor';
 
 interface IPlanningPlanCommandArgs {
 	readonly sessionResource: URI | string;
@@ -101,6 +104,8 @@ interface IPlanningPlanCommandArgs {
 	readonly previousRequestId?: string;
 	readonly planText?: string;
 	readonly previousPlanText?: string;
+	readonly planSteps?: readonly IChatPlanningPlanEditorStep[];
+	readonly planEditorResolveId?: string;
 }
 
 const defaultChat = {
@@ -1618,29 +1623,120 @@ export function registerChatActions() {
 		return extractPlanningPlanText(request?.response?.response);
 	}
 
-	function buildPlanningPlanEditorContents(currentPlanText: string, previousPlanText: string | undefined): string {
-		const changeSummary = summarizePlanningPlanChanges(previousPlanText, currentPlanText);
-		if (!changeSummary) {
-			return currentPlanText;
+	interface IPlanningPlanWebviewQuestion {
+		readonly id: string;
+		readonly type: IChatQuestion['type'];
+		readonly title: string;
+		readonly message?: string;
+		readonly description?: string;
+		readonly options?: readonly { readonly id: string; readonly label: string; readonly value: string }[];
+		readonly defaultValue?: string | string[];
+		readonly allowFreeformInput?: boolean;
+		readonly required?: boolean;
+	}
+
+	interface IPlanningPlanWebviewStep {
+		readonly id: string;
+		readonly index: number;
+		readonly label: string;
+		readonly text: string;
+		readonly sectionTitle?: string;
+		readonly kind: IChatPlanningPlanEditorStep['kind'];
+		readonly questions?: readonly IPlanningPlanWebviewQuestion[];
+	}
+
+	function getPlanningPlanEditorSteps(currentPlanText: string, planSteps?: readonly IChatPlanningPlanEditorStep[]): readonly IChatPlanningPlanEditorStep[] {
+		const extractedSteps = extractPlanningPlanSteps(currentPlanText);
+		return planSteps?.length
+			? planSteps
+			: extractedSteps.length > 0
+				? extractedSteps.map(step => ({
+					id: `step-${step.index}`,
+					index: step.index,
+					label: step.label,
+					text: step.text,
+					sectionTitle: step.sectionTitle,
+					kind: step.kind,
+				}))
+				: [{
+					index: 1,
+					id: 'step-1',
+					label: localize('openPlanningPlan.wholePlanFallbackLabel', 'Review the whole plan'),
+					text: currentPlanText,
+					kind: 'step' as const,
+				}];
+	}
+
+	function toPlanningPlanWebviewQuestion(question: IChatQuestion): IPlanningPlanWebviewQuestion {
+		const message = typeof question.message === 'string' ? question.message : question.message?.value;
+		return {
+			id: question.id,
+			type: question.type,
+			title: question.title,
+			...(message ? { message } : {}),
+			...(question.description ? { description: question.description } : {}),
+			...(question.options?.length ? { options: question.options.map(option => ({ id: option.id, label: option.label, value: option.value })) } : {}),
+			...(question.defaultValue !== undefined ? { defaultValue: question.defaultValue } : {}),
+			...(question.allowFreeformInput !== undefined ? { allowFreeformInput: question.allowFreeformInput } : {}),
+			...(question.required !== undefined ? { required: question.required } : {}),
+		};
+	}
+
+	function toPlanningPlanWebviewStep(step: IChatPlanningPlanEditorStep): IPlanningPlanWebviewStep {
+		const questions = step.questions?.length ? step.questions : [createFallbackPlanningPlanQuestion(step.kind)];
+		return {
+			id: step.id,
+			index: step.index,
+			label: step.label,
+			text: step.text,
+			...(step.sectionTitle ? { sectionTitle: step.sectionTitle } : {}),
+			kind: step.kind,
+			questions: questions.map(toPlanningPlanWebviewQuestion),
+		};
+	}
+
+	function toWebviewScriptLiteral(value: unknown): string {
+		return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, character => {
+			switch (character) {
+				case '<': return '\\u003c';
+				case '>': return '\\u003e';
+				case '&': return '\\u0026';
+				case '\u2028': return '\\u2028';
+				case '\u2029': return '\\u2029';
+				default: return character;
+			}
+		});
+	}
+
+	function isPlanningPlanWebviewSubmitMessage(message: unknown): message is { readonly type: 'apply' | 'continue'; readonly answers?: IChatQuestionAnswers } {
+		return typeof message === 'object'
+			&& message !== null
+			&& ('type' in message)
+			&& (message.type === 'apply' || message.type === 'continue');
+	}
+
+	function createFallbackPlanningPlanQuestion(kind: IPlanningPlanStep['kind']): IChatQuestion {
+		return {
+			id: `fallback-${kind}`,
+			type: 'text',
+			title: localize('openPlanningPlan.fallbackQuestionTitle', 'Refinement Question'),
+			message: getPlanningPlanStepQuestion(kind),
+			allowFreeformInput: true,
+			required: false,
+		};
+	}
+
+	function getPlanningPlanStepQuestion(kind: IPlanningPlanStep['kind']): string {
+		switch (kind) {
+			case 'verification':
+				return localize('openPlanningPlan.verificationQuestion', 'What evidence or check would make this verification step sufficient?');
+			case 'decision':
+				return localize('openPlanningPlan.decisionQuestion', 'What decision needs to be resolved before this step is useful?');
+			case 'guardrail':
+				return localize('openPlanningPlan.guardrailQuestion', 'What constraint or assumption should this guardrail capture?');
+			default:
+				return localize('openPlanningPlan.stepQuestion', 'What should change before this step is implemented?');
 		}
-
-		const diffLines = [
-			...changeSummary.added.map(line => `+ ${line}`),
-			...changeSummary.removed.map(line => `- ${line}`),
-		];
-
-		return [
-			'# Planning Plan',
-			'',
-			'## Changes in This Revision',
-			'```diff',
-			...diffLines,
-			'```',
-			'',
-			'## Current Plan',
-			'',
-			currentPlanText,
-		].join('\n');
 	}
 
 	function createPlanningPlanEditorInput(title: string, requestId: string, contents: string): IUntitledTextResourceEditorInput {
@@ -1652,6 +1748,960 @@ export function registerChatActions() {
 			contents,
 			languageId: 'markdown',
 		};
+	}
+
+	function buildPlanningPlanWebviewHtml(currentPlanText: string, previousPlanText: string | undefined, planSteps: readonly IChatPlanningPlanEditorStep[], canSubmit: boolean): string {
+		const nonce = generateUuid();
+		const changeSummary = summarizePlanningPlanChanges(previousPlanText, currentPlanText);
+		const data = {
+			currentPlanText,
+			changeSummary,
+			steps: planSteps.map(toPlanningPlanWebviewStep),
+			canSubmit,
+			labels: {
+				title: localize('openPlanningPlan.webviewTitle', 'Planning Plan'),
+				changes: localize('openPlanningPlan.webviewChanges', 'Changes in This Revision'),
+				currentPlan: localize('openPlanningPlan.webviewCurrentPlan', 'Current Plan'),
+				editSection: localize('openPlanningPlan.webviewEditSection', 'Edit Selected Section'),
+				inlineQuestions: localize('openPlanningPlan.webviewInlineQuestions', 'Inline Plan Questions'),
+				question: localize('openPlanningPlan.webviewQuestion', 'Question'),
+				options: localize('openPlanningPlan.webviewOptions', 'Options'),
+				freeform: localize('openPlanningPlan.webviewFreeform', 'Additional answer or note'),
+				stepDecision: localize('openPlanningPlan.webviewStepDecision', 'Step Decision'),
+				keep: localize('openPlanningPlan.webviewKeep', 'Keep this step'),
+				revise: localize('openPlanningPlan.webviewRevise', 'Revise this step'),
+				defer: localize('openPlanningPlan.webviewDefer', 'Defer or remove this step'),
+				split: localize('openPlanningPlan.webviewSplit', 'Split this into smaller steps'),
+				stepNotes: localize('openPlanningPlan.webviewStepNotes', 'Step notes'),
+				additionalEdits: localize('openPlanningPlan.webviewAdditionalEdits', 'Other edits'),
+				continue: localize('openPlanningPlan.webviewContinue', 'Continue'),
+				applyEdits: localize('openPlanningPlan.webviewApplyEdits', 'Apply Edits'),
+				submitted: localize('openPlanningPlan.webviewSubmitted', 'Plan edits submitted.'),
+				readOnly: localize('openPlanningPlan.webviewReadOnly', 'This opened plan is read-only because the chat review session is no longer active.'),
+			}
+		};
+
+		return `<!DOCTYPE html>
+			<html lang="${language}">
+			<head>
+				<meta charset="UTF-8">
+				<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+				<meta name="viewport" content="width=device-width, initial-scale=1.0">
+				<title>${data.labels.title}</title>
+				<style nonce="${nonce}">
+					:root {
+						color-scheme: light dark;
+					}
+
+					body {
+						margin: 0;
+						padding: 0;
+						color: var(--vscode-editor-foreground);
+						background: var(--vscode-editor-background);
+						font-family: var(--vscode-font-family);
+						font-size: var(--vscode-font-size);
+						line-height: 1.45;
+					}
+
+					button, textarea, input {
+						font-family: inherit;
+						font-size: inherit;
+					}
+
+					.plan-shell {
+						box-sizing: border-box;
+						max-width: 1180px;
+						margin: 0 auto;
+						padding: 20px 24px 28px;
+					}
+
+					.plan-header {
+						display: flex;
+						justify-content: space-between;
+						gap: 16px;
+						align-items: flex-start;
+						border-bottom: 1px solid var(--vscode-editorWidget-border);
+						padding-bottom: 12px;
+						margin-bottom: 18px;
+					}
+
+					h1, h2, h3 {
+						margin: 0;
+						font-weight: 600;
+						line-height: 1.3;
+						letter-spacing: 0;
+					}
+
+					h1 {
+						font-size: 22px;
+					}
+
+					h2 {
+						font-size: 16px;
+						margin: 22px 0 10px;
+					}
+
+					h3 {
+						font-size: 14px;
+					}
+
+					.actions {
+						display: flex;
+						gap: 8px;
+						flex-wrap: wrap;
+						justify-content: flex-end;
+					}
+
+					.button {
+						min-height: 28px;
+						border: 1px solid transparent;
+						border-radius: 4px;
+						padding: 4px 12px;
+						color: var(--vscode-button-foreground);
+						background: var(--vscode-button-background);
+						cursor: pointer;
+					}
+
+					.button.secondary {
+						color: var(--vscode-button-secondaryForeground);
+						background: var(--vscode-button-secondaryBackground);
+					}
+
+					.button:hover:not(:disabled) {
+						background: var(--vscode-button-hoverBackground);
+					}
+
+					.button.secondary:hover:not(:disabled) {
+						background: var(--vscode-button-secondaryHoverBackground);
+					}
+
+					.button:disabled {
+						opacity: 0.5;
+						cursor: default;
+					}
+
+					.status {
+						color: var(--vscode-descriptionForeground);
+						margin-top: 8px;
+						min-height: 20px;
+					}
+
+					.readonly {
+						border: 1px solid var(--vscode-inputValidation-warningBorder);
+						background: var(--vscode-inputValidation-warningBackground);
+						color: var(--vscode-inputValidation-warningForeground);
+						border-radius: 4px;
+						padding: 8px 10px;
+						margin-bottom: 16px;
+					}
+
+					.markdown {
+						border-left: 3px solid var(--vscode-textBlockQuote-border);
+						padding-left: 12px;
+						color: var(--vscode-foreground);
+					}
+
+					.markdown p {
+						margin: 6px 0;
+						overflow-wrap: anywhere;
+					}
+
+					.markdown ul,
+					.markdown ol {
+						margin: 6px 0 6px 20px;
+						padding: 0;
+					}
+
+					.markdown li {
+						margin: 4px 0;
+						overflow-wrap: anywhere;
+					}
+
+					.markdown pre {
+						white-space: pre-wrap;
+						overflow-wrap: anywhere;
+						background: var(--vscode-textCodeBlock-background);
+						border-radius: 4px;
+						padding: 8px;
+					}
+
+					.diff {
+						display: grid;
+						gap: 4px;
+						border: 1px solid var(--vscode-editorWidget-border);
+						border-radius: 6px;
+						padding: 8px;
+						background: var(--vscode-sideBar-background);
+					}
+
+					.diff-line {
+						white-space: pre-wrap;
+						overflow-wrap: anywhere;
+					}
+
+					.diff-line.added {
+						color: var(--vscode-gitDecoration-addedResourceForeground);
+					}
+
+					.diff-line.removed {
+						color: var(--vscode-gitDecoration-deletedResourceForeground);
+					}
+
+					.step-list {
+						display: flex;
+						flex-direction: column;
+						gap: 8px;
+					}
+
+					.plan-workspace {
+						display: grid;
+						grid-template-columns: minmax(0, 1fr) minmax(320px, 0.74fr);
+						gap: 18px;
+						align-items: start;
+					}
+
+					.plan-overview h2 {
+						margin-top: 0;
+					}
+
+					.plan-editor-panel {
+						border: 1px solid var(--vscode-editorWidget-border);
+						border-radius: 6px;
+						background: var(--vscode-sideBar-background);
+						padding: 14px;
+						position: sticky;
+						top: 16px;
+					}
+
+					.plan-editor-panel h2 {
+						margin-top: 0;
+					}
+
+					.step-button {
+						display: block;
+						width: 100%;
+						border: 1px solid var(--vscode-editorWidget-border);
+						border-radius: 6px;
+						background: var(--vscode-sideBar-background);
+						color: var(--vscode-editor-foreground);
+						padding: 12px;
+						text-align: left;
+						cursor: pointer;
+					}
+
+					.step-button:hover:not(:disabled),
+					.step-button.active {
+						border-color: var(--vscode-focusBorder);
+						background: var(--vscode-list-hoverBackground);
+					}
+
+					.step-button:disabled {
+						cursor: default;
+					}
+
+					.step-button.active {
+						outline: 1px solid var(--vscode-focusBorder);
+					}
+
+					.step-title {
+						display: grid;
+						grid-template-columns: 28px minmax(0, 1fr);
+						gap: 10px;
+						align-items: start;
+						margin-bottom: 8px;
+					}
+
+					.step-index {
+						display: inline-flex;
+						align-items: center;
+						justify-content: center;
+						width: 24px;
+						height: 24px;
+						border-radius: 50%;
+						background: var(--vscode-badge-background);
+						color: var(--vscode-badge-foreground);
+						font-size: 12px;
+						font-weight: 600;
+					}
+
+					.step-markdown {
+						margin-left: 38px;
+						color: var(--vscode-descriptionForeground);
+					}
+
+					.selected-step-detail {
+						margin: 8px 0 12px;
+						color: var(--vscode-descriptionForeground);
+					}
+
+					.question-stack {
+						display: flex;
+						flex-direction: column;
+						gap: 12px;
+					}
+
+					.question-block {
+						margin: 0;
+						border-top: 1px solid var(--vscode-editorWidget-border);
+						padding-top: 10px;
+					}
+
+					.question-title {
+						font-weight: 600;
+						margin-bottom: 4px;
+					}
+
+					.question-message,
+					.question-description {
+						color: var(--vscode-descriptionForeground);
+						margin: 4px 0;
+						overflow-wrap: anywhere;
+					}
+
+					.option-list,
+					.decision-list {
+						display: flex;
+						flex-wrap: wrap;
+						gap: 8px 14px;
+						margin-top: 8px;
+					}
+
+					label.option,
+					label.decision {
+						display: inline-flex;
+						gap: 6px;
+						align-items: center;
+						max-width: 100%;
+					}
+
+					textarea {
+						box-sizing: border-box;
+						width: 100%;
+						min-height: 34px;
+						resize: vertical;
+						border: 1px solid var(--vscode-input-border);
+						border-radius: 4px;
+						background: var(--vscode-input-background);
+						color: var(--vscode-input-foreground);
+						padding: 6px 8px;
+						line-height: 1.4;
+					}
+
+					.text-answer,
+					.freeform-answer,
+					.step-note,
+					.additional {
+						margin-top: 8px;
+					}
+
+					.field-label {
+						display: block;
+						margin: 12px 0 5px;
+						font-weight: 600;
+					}
+
+					@media (max-width: 560px) {
+						.plan-shell {
+							padding: 14px;
+						}
+
+						.plan-header {
+							display: block;
+						}
+
+						.actions {
+							justify-content: flex-start;
+							margin-top: 12px;
+						}
+
+						.step-markdown,
+						.question-block {
+							margin-left: 0;
+						}
+					}
+
+					@media (max-width: 860px) {
+						.plan-workspace {
+							grid-template-columns: 1fr;
+						}
+
+						.plan-editor-panel {
+							position: static;
+						}
+					}
+				</style>
+			</head>
+			<body>
+				<div id="app"></div>
+				<script nonce="${nonce}">
+					const vscode = acquireVsCodeApi();
+					const data = ${toWebviewScriptLiteral(data)};
+					const savedState = vscode.getState?.() || {};
+					const root = document.getElementById('app');
+					const controlMap = new Map();
+					let submitted = savedState.submitted === true;
+					document.addEventListener('input', markDirty, true);
+					document.addEventListener('change', markDirty, true);
+
+					function markDirty(event) {
+						savedState.dirty = true;
+						const key = event.target?.dataset?.answerKey;
+						if (key) {
+							savedState.dirtyKeys = savedState.dirtyKeys || {};
+							savedState.dirtyKeys[key] = true;
+						}
+					}
+
+					function isDirtyKey(key) {
+						return savedState.dirtyKeys?.[key] === true;
+					}
+
+					function el(tag, className, text) {
+						const node = document.createElement(tag);
+						if (className) {
+							node.className = className;
+						}
+						if (text !== undefined) {
+							node.textContent = text;
+						}
+						return node;
+					}
+
+					function render() {
+						root.textContent = '';
+						controlMap.clear();
+						const shell = el('main', 'plan-shell');
+						root.appendChild(shell);
+
+						const header = el('header', 'plan-header');
+						const title = el('h1', undefined, data.labels.title);
+						header.appendChild(title);
+						const actions = el('div', 'actions');
+						const continueButton = el('button', 'button secondary', data.labels.continue);
+						const applyButton = el('button', 'button', data.labels.applyEdits);
+						continueButton.type = 'button';
+						applyButton.type = 'button';
+						continueButton.disabled = !data.canSubmit || submitted;
+						applyButton.disabled = !data.canSubmit || submitted || !hasEdits();
+						continueButton.addEventListener('click', () => submit('continue'));
+						applyButton.addEventListener('click', () => submit('apply'));
+						actions.appendChild(continueButton);
+						actions.appendChild(applyButton);
+						header.appendChild(actions);
+						shell.appendChild(header);
+
+						if (!data.canSubmit) {
+							shell.appendChild(el('div', 'readonly', data.labels.readOnly));
+						}
+
+						if (data.changeSummary && (data.changeSummary.added?.length || data.changeSummary.removed?.length)) {
+							shell.appendChild(el('h2', undefined, data.labels.changes));
+							const diff = el('div', 'diff');
+							for (const line of data.changeSummary.added || []) {
+								diff.appendChild(el('div', 'diff-line added', '+ ' + line));
+							}
+							for (const line of data.changeSummary.removed || []) {
+								diff.appendChild(el('div', 'diff-line removed', '- ' + line));
+							}
+							shell.appendChild(diff);
+						}
+
+						const selectedStep = getSelectedStep();
+						const workspace = el('section', 'plan-workspace');
+						const overview = el('section', 'plan-overview');
+						overview.appendChild(el('h2', undefined, data.labels.currentPlan));
+						const steps = el('div', 'step-list');
+						for (const step of data.steps) {
+							steps.appendChild(renderStepSummary(step, selectedStep?.id === step.id));
+						}
+						overview.appendChild(steps);
+						workspace.appendChild(overview);
+
+						const editorPanel = el('aside', 'plan-editor-panel');
+						if (selectedStep) {
+							renderSelectedStepEditor(editorPanel, selectedStep);
+						}
+						workspace.appendChild(editorPanel);
+						shell.appendChild(workspace);
+
+						const additionalLabel = el('label', 'field-label', data.labels.additionalEdits);
+						additionalLabel.htmlFor = 'plan-editor-additional';
+						shell.appendChild(additionalLabel);
+						const additional = el('textarea', 'additional');
+						additional.id = 'plan-editor-additional';
+						additional.dataset.answerKey = 'plan-editor-additional';
+						additional.rows = 3;
+						additional.value = savedState.additional || '';
+						additional.addEventListener('input', () => {
+							savedState.additional = additional.value;
+							persistState();
+							applyButton.disabled = !data.canSubmit || submitted || !hasEdits();
+						});
+						shell.appendChild(additional);
+
+						const status = el('div', 'status', submitted ? data.labels.submitted : '');
+						status.id = 'plan-status';
+						shell.appendChild(status);
+						controlMap.set('additional', additional);
+						updateApplyButton();
+						updateDisabledState();
+					}
+
+					function getSelectedStep() {
+						if (!data.steps?.length) {
+							return undefined;
+						}
+						const selected = data.steps.find(step => step.id === savedState.selectedStepId);
+						return selected || data.steps[0];
+					}
+
+					function selectStep(step) {
+						savedState.selectedStepId = step.id;
+						persistState();
+						render();
+					}
+
+					function renderMarkdown(container, text) {
+						const lines = String(text || '').split(/\\r?\\n/g);
+						let list;
+						let pre;
+						for (const raw of lines) {
+							const line = raw.trimEnd();
+							if (line.startsWith('\\x60\\x60\\x60')) {
+								if (pre) {
+									container.appendChild(pre);
+									pre = undefined;
+								} else {
+									pre = el('pre');
+									pre.textContent = '';
+								}
+								continue;
+							}
+							if (pre) {
+								pre.textContent += (pre.textContent ? '\\n' : '') + raw;
+								continue;
+							}
+							if (!line.trim()) {
+								list = undefined;
+								continue;
+							}
+							const heading = /^(#{1,6})\\s+(.+)$/.exec(line);
+							if (heading) {
+								list = undefined;
+								container.appendChild(el(heading[1].length <= 2 ? 'h2' : 'h3', undefined, heading[2]));
+								continue;
+							}
+							const ordered = /^\\d+[.)]\\s+(.+)$/.exec(line.trim());
+							const unordered = /^[-*+]\\s+(.+)$/.exec(line.trim());
+							if (ordered || unordered) {
+								const listType = ordered ? 'ol' : 'ul';
+								if (!list || list.tagName.toLowerCase() !== listType) {
+									list = el(listType);
+									container.appendChild(list);
+								}
+								list.appendChild(el('li', undefined, (ordered || unordered)[1]));
+								continue;
+							}
+							list = undefined;
+							container.appendChild(el('p', undefined, line));
+						}
+						if (pre) {
+							container.appendChild(pre);
+						}
+					}
+
+					function renderStepSummary(step, active) {
+						const article = el('button', active ? 'step-button active' : 'step-button');
+						article.type = 'button';
+						article.disabled = submitted;
+						article.addEventListener('click', () => selectStep(step));
+						const title = el('div', 'step-title');
+						title.appendChild(el('span', 'step-index', String(step.index)));
+						const headingText = step.sectionTitle && step.kind !== 'step'
+							? step.sectionTitle + ': ' + step.label
+							: step.label;
+						title.appendChild(el('h3', undefined, headingText));
+						article.appendChild(title);
+						if (step.text && step.text !== step.label) {
+							const stepMarkdown = el('div', 'markdown step-markdown');
+							renderMarkdown(stepMarkdown, step.text);
+							article.appendChild(stepMarkdown);
+						}
+						return article;
+					}
+
+					function renderSelectedStepEditor(container, step) {
+						container.appendChild(el('h2', undefined, data.labels.editSection));
+						const title = el('div', 'step-title');
+						title.appendChild(el('span', 'step-index', String(step.index)));
+						const headingText = step.sectionTitle && step.kind !== 'step'
+							? step.sectionTitle + ': ' + step.label
+							: step.label;
+						title.appendChild(el('h3', undefined, headingText));
+						container.appendChild(title);
+						if (step.text && step.text !== step.label) {
+							const stepMarkdown = el('div', 'markdown selected-step-detail');
+							renderMarkdown(stepMarkdown, step.text);
+							container.appendChild(stepMarkdown);
+						}
+						const stack = el('div', 'question-stack');
+						for (const question of step.questions || []) {
+							stack.appendChild(renderQuestion(step, question));
+						}
+						stack.appendChild(renderStepDecision(step));
+						container.appendChild(stack);
+					}
+
+					function renderQuestion(step, question) {
+						const block = el('div', 'question-block');
+						block.appendChild(el('div', 'question-title', question.title));
+						if (question.message && question.message !== question.title) {
+							block.appendChild(el('div', 'question-message', question.message));
+						}
+						if (question.description) {
+							block.appendChild(el('div', 'question-description', question.description));
+						}
+						const key = 'plan-editor-question-' + step.id + '-' + question.id;
+						if (question.type === 'text') {
+							const textarea = el('textarea', 'text-answer');
+							textarea.dataset.answerKey = key;
+							textarea.rows = 2;
+							textarea.value = savedState[key] || '';
+							textarea.addEventListener('input', () => {
+								savedState[key] = textarea.value;
+								persistState();
+								updateApplyButton();
+							});
+							controlMap.set(key, { question, text: textarea });
+							block.appendChild(textarea);
+							return block;
+						}
+						const optionList = el('div', 'option-list');
+						const defaults = new Set(Array.isArray(question.defaultValue) ? question.defaultValue : question.defaultValue ? [question.defaultValue] : []);
+						const saved = savedState[key];
+						const selectedValues = new Set(Array.isArray(saved?.selectedValues) ? saved.selectedValues : saved?.selectedValue ? [saved.selectedValue] : []);
+						for (const option of question.options || []) {
+							const label = el('label', 'option');
+							const input = document.createElement('input');
+							input.type = question.type === 'singleSelect' ? 'radio' : 'checkbox';
+							input.name = key;
+							input.dataset.answerKey = key;
+							input.value = option.value;
+							input.checked = selectedValues.has(option.value) || selectedValues.has(option.label) || (!saved && (defaults.has(option.label) || defaults.has(option.value)));
+							input.addEventListener('change', () => {
+								saveQuestionChoiceState(key, question);
+								updateApplyButton();
+							});
+							label.appendChild(input);
+							label.appendChild(document.createTextNode(option.label));
+							optionList.appendChild(label);
+						}
+						block.appendChild(optionList);
+						const freeform = el('textarea', 'freeform-answer');
+						freeform.dataset.answerKey = key;
+						freeform.rows = 2;
+						freeform.value = saved?.freeformValue || '';
+						freeform.disabled = question.allowFreeformInput === false;
+						freeform.placeholder = data.labels.freeform;
+						freeform.addEventListener('input', () => {
+							saveQuestionChoiceState(key, question);
+							updateApplyButton();
+						});
+						if (question.allowFreeformInput !== false) {
+							block.appendChild(freeform);
+						}
+						controlMap.set(key, { question, optionList, freeform });
+						saveQuestionChoiceState(key, question, false);
+						return block;
+					}
+
+					function renderStepDecision(step) {
+						const key = 'plan-editor-step-' + step.id;
+						const section = el('div', 'question-block');
+						section.appendChild(el('div', 'question-title', data.labels.stepDecision));
+						const choices = el('div', 'decision-list');
+						const saved = savedState[key];
+						const selected = new Set(Array.isArray(saved?.selectedValues) ? saved.selectedValues : ['keep']);
+						for (const choice of [
+							['keep', data.labels.keep],
+							['revise', data.labels.revise],
+							['defer', data.labels.defer],
+							['split', data.labels.split],
+						]) {
+							const label = el('label', 'decision');
+							const input = document.createElement('input');
+							input.type = 'checkbox';
+							input.dataset.answerKey = key;
+							input.value = choice[0];
+							input.checked = selected.has(choice[0]);
+							input.addEventListener('change', () => {
+								if (choice[0] !== 'keep' && input.checked) {
+									for (const other of choices.querySelectorAll('input[value="keep"]')) {
+										other.checked = false;
+									}
+								}
+								if (choice[0] === 'keep' && input.checked) {
+									for (const other of choices.querySelectorAll('input:not([value="keep"])')) {
+										other.checked = false;
+									}
+								}
+								if (!choices.querySelector('input:checked')) {
+									choices.querySelector('input[value="keep"]').checked = true;
+								}
+								saveStepDecisionState(key);
+								updateApplyButton();
+							});
+							label.appendChild(input);
+							label.appendChild(document.createTextNode(choice[1]));
+							choices.appendChild(label);
+						}
+						section.appendChild(choices);
+						const noteLabel = el('label', 'field-label', data.labels.stepNotes);
+						const note = el('textarea', 'step-note');
+						note.dataset.answerKey = key;
+						note.rows = 2;
+						note.value = saved?.freeformValue || '';
+						note.addEventListener('input', () => {
+							saveStepDecisionState(key);
+							updateApplyButton();
+						});
+						section.appendChild(noteLabel);
+						section.appendChild(note);
+						controlMap.set(key, { choices, note });
+						saveStepDecisionState(key, false);
+						return section;
+					}
+
+					function saveQuestionChoiceState(key, question, persist = true) {
+						const control = controlMap.get(key);
+						if (!control) {
+							return;
+						}
+						if (question.type === 'text') {
+							savedState[key] = control.text.value;
+						} else {
+							const selected = Array.from(control.optionList.querySelectorAll('input:checked')).map(input => input.value);
+							if (question.type === 'singleSelect') {
+								savedState[key] = {
+									selectedValue: selected[0],
+									...(control.freeform?.value.trim() ? { freeformValue: control.freeform.value.trim() } : {}),
+								};
+							} else {
+								savedState[key] = {
+									selectedValues: selected,
+									...(control.freeform?.value.trim() ? { freeformValue: control.freeform.value.trim() } : {}),
+								};
+							}
+						}
+						if (persist) {
+							persistState();
+						}
+					}
+
+					function saveStepDecisionState(key, persist = true) {
+						const control = controlMap.get(key);
+						if (!control) {
+							return;
+						}
+						const selectedValues = Array.from(control.choices.querySelectorAll('input:checked')).map(input => input.value);
+						savedState[key] = {
+							selectedValues,
+							...(control.note.value.trim() ? { freeformValue: control.note.value.trim() } : {}),
+						};
+						if (persist) {
+							persistState();
+						}
+					}
+
+					function collectAnswers() {
+						const answers = {};
+						for (const step of data.steps) {
+							const stepKey = 'plan-editor-step-' + step.id;
+							if (isDirtyKey(stepKey)) {
+								saveStepDecisionState(stepKey, false);
+								const answer = savedState[stepKey];
+								if (answer?.selectedValues?.length || answer?.freeformValue) {
+									answers[stepKey] = answer;
+								}
+							}
+							for (const question of step.questions || []) {
+								const questionKey = 'plan-editor-question-' + step.id + '-' + question.id;
+								if (!isDirtyKey(questionKey)) {
+									continue;
+								}
+								const control = controlMap.get(questionKey);
+								if (question.type === 'text') {
+									const value = control?.text?.value.trim() ?? (typeof savedState[questionKey] === 'string' ? savedState[questionKey].trim() : '');
+									if (value) {
+										answers[questionKey] = value;
+									}
+								} else {
+									saveQuestionChoiceState(questionKey, question, false);
+									const answer = savedState[questionKey];
+									if (question.type === 'singleSelect') {
+										if (answer?.selectedValue || answer?.freeformValue) {
+											answers[questionKey] = answer;
+										}
+									} else if (answer?.selectedValues?.length || answer?.freeformValue) {
+										answers[questionKey] = answer;
+									}
+								}
+							}
+						}
+						const additional = controlMap.get('additional')?.value.trim() ?? (typeof savedState.additional === 'string' ? savedState.additional.trim() : '');
+						if (isDirtyKey('plan-editor-additional') && additional) {
+							answers['plan-editor-additional'] = additional;
+						}
+						return answers;
+					}
+
+					function hasEdits() {
+						if (savedState.dirty !== true) {
+							return false;
+						}
+						const additional = controlMap.get('additional')?.value.trim() ?? (typeof savedState.additional === 'string' ? savedState.additional.trim() : '');
+						if (isDirtyKey('plan-editor-additional') && additional) {
+							return true;
+						}
+						for (const step of data.steps) {
+							const stepKey = 'plan-editor-step-' + step.id;
+							if (isDirtyKey(stepKey)) {
+								const control = controlMap.get(stepKey);
+								const saved = savedState[stepKey];
+								const selected = control
+									? Array.from(control.choices.querySelectorAll('input:checked')).map(input => input.value)
+									: Array.isArray(saved?.selectedValues) ? saved.selectedValues : [];
+								const note = control?.note?.value.trim() ?? (typeof saved?.freeformValue === 'string' ? saved.freeformValue.trim() : '');
+								if (selected.some(value => value !== 'keep') || note) {
+									return true;
+								}
+							}
+							for (const question of step.questions || []) {
+								const questionKey = 'plan-editor-question-' + step.id + '-' + question.id;
+								if (!isDirtyKey(questionKey)) {
+									continue;
+								}
+								const control = controlMap.get(questionKey);
+								const saved = savedState[questionKey];
+								if (question.type === 'text') {
+									const value = control?.text?.value.trim() ?? (typeof saved === 'string' ? saved.trim() : '');
+									if (value) {
+										return true;
+									}
+									continue;
+								}
+								const selected = control
+									? Array.from(control.optionList.querySelectorAll('input:checked')).map(input => input.value)
+									: Array.isArray(saved?.selectedValues)
+										? saved.selectedValues
+										: saved?.selectedValue ? [saved.selectedValue] : [];
+								const freeform = control?.freeform?.value.trim() ?? (typeof saved?.freeformValue === 'string' ? saved.freeformValue.trim() : '');
+								if (selected.length || freeform) {
+									return true;
+								}
+							}
+						}
+						return false;
+					}
+
+					function updateApplyButton() {
+						const button = document.querySelector('.button:not(.secondary)');
+						if (button) {
+							button.disabled = !data.canSubmit || submitted || !hasEdits();
+						}
+					}
+
+					function updateDisabledState() {
+						if (!submitted) {
+							return;
+						}
+						for (const control of document.querySelectorAll('button, textarea, input')) {
+							control.disabled = true;
+						}
+					}
+
+					function submit(type) {
+						if (!data.canSubmit || submitted) {
+							return;
+						}
+						const answers = collectAnswers();
+						submitted = true;
+						savedState.submitted = true;
+						persistState();
+						updateDisabledState();
+						const status = document.getElementById('plan-status');
+						if (status) {
+							status.textContent = data.labels.submitted;
+						}
+						vscode.postMessage({ type, answers });
+					}
+
+					function persistState() {
+						vscode.setState?.(savedState);
+					}
+
+					window.addEventListener('message', event => {
+						if (event.data?.type === 'submitted') {
+							submitted = true;
+							savedState.submitted = true;
+							persistState();
+							updateDisabledState();
+							const status = document.getElementById('plan-status');
+							if (status) {
+								status.textContent = data.labels.submitted;
+							}
+						}
+					});
+
+					render();
+				</script>
+			</body>
+			</html>`;
+	}
+
+	async function openPlanningPlanWebview(accessor: ServicesAccessor, args: IPlanningPlanCommandArgs, group: typeof ACTIVE_GROUP | typeof SIDE_GROUP): Promise<void> {
+		const chatService = accessor.get(IChatService);
+		const webviewWorkbenchService = accessor.get(IWebviewWorkbenchService);
+		const notificationService = accessor.get(INotificationService);
+		const sessionResource = revivePlanningSessionResource(args.sessionResource);
+		const planText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
+		const previousPlanText = args.previousPlanText ?? (args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined);
+		if (!planText) {
+			notificationService.warn(localize('openPlanningPlan.missing', 'The selected plan is no longer available in this chat session.'));
+			return;
+		}
+
+		const planSteps = getPlanningPlanEditorSteps(planText, args.planSteps);
+		const title = localize('openPlanningPlan.editorTitle', 'Planning Plan');
+		const webviewInput = webviewWorkbenchService.openWebview({
+			providedViewType: PLANNING_PLAN_WEBVIEW_VIEW_TYPE,
+			title,
+			options: {
+				purpose: WebviewContentPurpose.CustomEditor,
+				enableFindWidget: true,
+				retainContextWhenHidden: true,
+			},
+			contentOptions: {
+				allowScripts: true,
+				allowForms: true,
+			},
+			extension: undefined,
+		}, PLANNING_PLAN_WEBVIEW_VIEW_TYPE, title, undefined, { group });
+
+		const listener = webviewInput.webview.onMessage(event => {
+			if (!isPlanningPlanWebviewSubmitMessage(event.message)) {
+				return;
+			}
+			if (!args.planEditorResolveId) {
+				notificationService.warn(localize('openPlanningPlan.notInteractive', 'This plan is no longer connected to an active chat review.'));
+				return;
+			}
+
+			chatService.notifyQuestionCarouselAnswer(args.requestId, args.planEditorResolveId, event.message.answers);
+			void webviewInput.webview.postMessage({ type: 'submitted' });
+		});
+		webviewInput.webview.onDidDispose(() => listener.dispose());
+		webviewInput.webview.setHtml(buildPlanningPlanWebviewHtml(planText, previousPlanText, planSteps, !!args.planEditorResolveId));
 	}
 
 	registerAction2(class OpenPlanningPlanAction extends Action2 {
@@ -1668,22 +2718,7 @@ export function registerChatActions() {
 			if (!args?.requestId || !args.sessionResource) {
 				return;
 			}
-
-			const chatService = accessor.get(IChatService);
-			const editorService = accessor.get(IEditorService);
-			const notificationService = accessor.get(INotificationService);
-			const sessionResource = revivePlanningSessionResource(args.sessionResource);
-			const planText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
-			const previousPlanText = args.previousPlanText ?? (args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined);
-			if (!planText) {
-				notificationService.warn(localize('openPlanningPlan.missing', 'The selected plan is no longer available in this chat session.'));
-				return;
-			}
-
-			await editorService.openEditor({
-				...createPlanningPlanEditorInput(localize('openPlanningPlan.editorTitle', 'Planning Plan'), args.requestId, buildPlanningPlanEditorContents(planText, previousPlanText)),
-				options: { pinned: true },
-			}, ACTIVE_GROUP);
+			await openPlanningPlanWebview(accessor, args, ACTIVE_GROUP);
 		}
 	});
 
@@ -1701,22 +2736,7 @@ export function registerChatActions() {
 			if (!args?.requestId || !args.sessionResource) {
 				return;
 			}
-
-			const chatService = accessor.get(IChatService);
-			const editorService = accessor.get(IEditorService);
-			const notificationService = accessor.get(INotificationService);
-			const sessionResource = revivePlanningSessionResource(args.sessionResource);
-			const planText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
-			const previousPlanText = args.previousPlanText ?? (args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined);
-			if (!planText) {
-				notificationService.warn(localize('openPlanningPlanToSide.missing', 'The selected plan is no longer available in this chat session.'));
-				return;
-			}
-
-			await editorService.openEditor({
-				...createPlanningPlanEditorInput(localize('openPlanningPlanToSide.editorTitle', 'Planning Plan'), args.requestId, buildPlanningPlanEditorContents(planText, previousPlanText)),
-				options: { pinned: true },
-			}, SIDE_GROUP);
+			await openPlanningPlanWebview(accessor, args, SIDE_GROUP);
 		}
 	});
 

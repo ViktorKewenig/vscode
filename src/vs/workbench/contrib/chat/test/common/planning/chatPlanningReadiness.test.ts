@@ -144,6 +144,7 @@ suite('ChatPlanningReadiness', () => {
 		});
 
 		assert.deepStrictEqual(readiness.taskDecomposition.missingDimensions, []);
+		assert.strictEqual(readiness.goalClarity.questionCount, 3);
 		assert.ok(readiness.taskDecomposition.presentDimensions.includes('repo-target'));
 		assert.ok(readiness.taskDecomposition.presentDimensions.includes('work-breakdown'));
 		assert.ok(readiness.taskDecomposition.presentDimensions.includes('validation'));

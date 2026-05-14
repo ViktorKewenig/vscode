@@ -76,6 +76,7 @@ const responsePartSchema = Adapt.v<IChatProgressResponseContent, SerializedChatR
 				case 'progressMessage':
 				case 'pullRequest':
 				case 'questionCarousel':
+				case 'planningPlanEditor':
 				case 'thinking':
 				case 'undoStop':
 				case 'warning':

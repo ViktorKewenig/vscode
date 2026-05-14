@@ -68,8 +68,10 @@ function assessStageReadiness(dimensions: readonly PlanningReadinessDimension[],
 		partialCount: partialDimensions.length,
 		shouldConfirmPlanningTarget,
 		hasCurrentPlan: !!input.currentPlan?.trim(),
+		isGoalClarity: dimensions.includes('desired-outcome'),
 		requestComplexity: requestProfile.complexity,
 		requestSpecificity: requestProfile.specificity,
+		requestIntent: input.repositoryContext?.requestIntent,
 		unknownCount: input.repositoryContext?.taskLens?.unknowns?.length ?? 0,
 	});
 
@@ -89,16 +91,25 @@ function computeQuestionCount(input: {
 	readonly partialCount: number;
 	readonly shouldConfirmPlanningTarget: boolean;
 	readonly hasCurrentPlan: boolean;
+	readonly isGoalClarity: boolean;
 	readonly requestComplexity: RequestComplexity;
 	readonly requestSpecificity: RequestSpecificity;
+	readonly requestIntent: string | undefined;
 	readonly unknownCount: number;
 }): number {
 	if (input.missingCount === 0 && input.partialCount === 0) {
+		let questionCount: number;
 		if (input.hasCurrentPlan) {
-			return input.requestComplexity === 'high' ? 2 : 1;
+			questionCount = input.requestComplexity === 'high' ? 2 : 1;
+		} else {
+			questionCount = input.requestSpecificity === 'high' ? 1 : 2;
 		}
 
-		return input.requestSpecificity === 'high' ? 1 : 2;
+		if (input.isGoalClarity && input.requestIntent === 'data-analysis') {
+			questionCount = Math.max(questionCount, input.shouldConfirmPlanningTarget ? 4 : 3);
+		}
+
+		return Math.min(Math.max(questionCount, 1), 4);
 	}
 
 	let questionCount = input.score >= 0.8
@@ -127,6 +138,10 @@ function computeQuestionCount(input: {
 
 	if (input.shouldConfirmPlanningTarget) {
 		questionCount = Math.max(questionCount, 3);
+	}
+
+	if (input.isGoalClarity && input.requestIntent === 'data-analysis') {
+		questionCount = Math.max(questionCount, input.shouldConfirmPlanningTarget ? 4 : 3);
 	}
 
 	return Math.min(Math.max(questionCount, 1), 4);

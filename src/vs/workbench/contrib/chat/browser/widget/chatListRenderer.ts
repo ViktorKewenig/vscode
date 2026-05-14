@@ -55,7 +55,7 @@ import { IChatAgentMetadata } from '../../common/participants/chatAgents.js';
 import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
 import { IChatTextEditGroup } from '../../common/model/chatModel.js';
 import { chatSubcommandLeader } from '../../common/requestParser/chatParserTypes.js';
-import { ChatAgentVoteDirection, ChatAgentVoteDownReason, ChatErrorLevel, ChatRequestQueueKind, IChatConfirmation, IChatContentReference, IChatDisabledClaudeHooksPart, IChatElicitationRequest, IChatElicitationRequestSerialized, IChatExtensionsContent, IChatFollowup, IChatHookPart, IChatMarkdownContent, IChatMcpServersStarting, IChatMcpServersStartingSerialized, IChatMultiDiffData, IChatMultiDiffDataSerialized, IChatPullRequestContent, IChatQuestionAnswerValue, IChatQuestionAnswers, IChatQuestionCarousel, IChatService, IChatTask, IChatTaskSerialized, IChatThinkingPart, IChatToolInvocation, IChatToolInvocationSerialized, IChatTreeData, IChatUndoStop, isChatFollowup } from '../../common/chatService/chatService.js';
+import { ChatAgentVoteDirection, ChatAgentVoteDownReason, ChatErrorLevel, ChatRequestQueueKind, IChatConfirmation, IChatContentReference, IChatDisabledClaudeHooksPart, IChatElicitationRequest, IChatElicitationRequestSerialized, IChatExtensionsContent, IChatFollowup, IChatHookPart, IChatMarkdownContent, IChatMcpServersStarting, IChatMcpServersStartingSerialized, IChatMultiDiffData, IChatMultiDiffDataSerialized, IChatPlanningPlanEditor, IChatPullRequestContent, IChatQuestionAnswerValue, IChatQuestionAnswers, IChatQuestionCarousel, IChatService, IChatTask, IChatTaskSerialized, IChatThinkingPart, IChatToolInvocation, IChatToolInvocationSerialized, IChatTreeData, IChatUndoStop, isChatFollowup } from '../../common/chatService/chatService.js';
 import { ChatQuestionCarouselData } from '../../common/model/chatProgressTypes/chatQuestionCarouselData.js';
 import { isPlanningMiddlewareQuestionCarousel } from '../../common/planning/chatPlanningTransition.js';
 import { localChatSessionType } from '../../common/chatSessionsService.js';
@@ -89,6 +89,7 @@ import { ChatMcpServersInteractionContentPart } from './chatContentParts/chatMcp
 import { ChatDisabledClaudeHooksContentPart } from './chatContentParts/chatDisabledClaudeHooksContentPart.js';
 import { ChatMultiDiffContentPart } from './chatContentParts/chatMultiDiffContentPart.js';
 import { ChatProgressContentPart, ChatWorkingProgressContentPart } from './chatContentParts/chatProgressContentPart.js';
+import { ChatPlanningPlanEditorPart } from './chatContentParts/chatPlanningPlanEditorPart.js';
 import { ChatPullRequestContentPart } from './chatContentParts/chatPullRequestContentPart.js';
 import { ChatQuotaExceededPart } from './chatContentParts/chatQuotaExceededPart.js';
 import { ChatCollapsibleListContentPart, ChatUsedReferencesListContentPart, CollapsibleListPool } from './chatContentParts/chatReferencesContentPart.js';
@@ -1829,6 +1830,8 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 				return this.renderElicitation(context, content, templateData);
 			} else if (content.kind === 'questionCarousel') {
 				return this.renderQuestionCarousel(context, content, templateData);
+			} else if (content.kind === 'planningPlanEditor') {
+				return this.renderPlanningPlanEditor(context, content, templateData);
 			} else if (content.kind === 'changesSummary') {
 				return this.renderChangesSummary(content, context, templateData);
 			} else if (content.kind === 'mcpServersStarting') {
@@ -2314,6 +2317,13 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			}
 			return false;
 		});
+	}
+
+	private renderPlanningPlanEditor(context: IChatContentPartRenderContext, editor: IChatPlanningPlanEditor, templateData: IChatListItemTemplate): IChatContentPart {
+		this.finalizeCurrentThinkingPart(context, templateData);
+		const part = this.instantiationService.createInstance(ChatPlanningPlanEditorPart, editor, context);
+		part.addDisposable(part.onDidChangeHeight(() => this.fireItemHeightChange(templateData)));
+		return part;
 	}
 
 	private _getCarouselStableKey(context: IChatContentPartRenderContext, carousel: IChatQuestionCarousel): string | undefined {

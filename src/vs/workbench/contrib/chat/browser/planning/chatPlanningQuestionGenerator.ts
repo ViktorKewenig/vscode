@@ -104,8 +104,17 @@ export async function generateDynamicPlanningQuestionsResult(
 					'If planning answers are already present, do not repeat those questions. Ask only narrower follow-up questions that use the refreshed context.',
 					'If the stage is goal-clarity, focus on desired outcome, constraints, definition of done, and what should be in or out of scope before the first plan is built.',
 					'If the stage is goal-clarity and planning answers are already present, make the next questions more concrete and artifact-specific than the earlier round.',
-					'If the stage is task-decomposition, assume the first plan already exists and focus on tightening the work breakdown, insertion points, sequencing, validation, and repo slice for the rebuild.',
-					'If the current plan already names files, directories, symbols, dependencies, or validation targets, make your task-decomposition questions explicitly reference those concrete plan slices.',
+					context.questionStage === 'task-decomposition'
+						? context.currentPlan
+							? 'If the stage is task-decomposition, assume the first plan already exists and focus on tightening the work breakdown, insertion points, sequencing, validation, and repo slice for the rebuild.'
+							: 'If the stage is task-decomposition and no current plan is provided, ask high-level plan-shaping questions before the first plan is built. Focus on the major work areas, sequencing preferences, edit boundaries, and validation approach.'
+						: '',
+					context.questionStage === 'task-decomposition' && !context.currentPlan
+						? 'When no current plan exists, include one question that surfaces the assumptions the first plan will make so the user can confirm, reject, or refine them quickly.'
+						: '',
+					context.currentPlan
+						? 'If the current plan already names files, directories, symbols, dependencies, or validation targets, make your task-decomposition questions explicitly reference those concrete plan slices.'
+						: '',
 					'If the stage is plan-focus, assume a rebuilt plan already exists and focus on sharpening one specific aspect of that plan rather than reopening the whole request.',
 					'If the stage is plan-focus, use the selected plan slice and latest plan text as the source of truth. Your questions should feel like a zoom-in on that exact slice, not generic follow-up.',
 					'If the stage is task-decomposition or plan-focus, treat prior goal-clarity answers as settled inputs, not new question topics.',
@@ -125,6 +134,8 @@ export async function generateDynamicPlanningQuestionsResult(
 					'For investigation work, prefer code path, evidence, uncertainty, and next-check questions.',
 					'If the request intent is data analysis, lead with the data file, related schema, output, or directory that matters most.',
 					'If the request intent is data analysis, prefer questions about the data file, related files, desired output, or result validation. Do not ask generic tooling or library questions unless the user or repo context suggests they matter.',
+					'If the request intent is data analysis and the stage is goal-clarity, ask directly what kind of analysis the user wants. Prefer a multi-select question with concrete options such as summary statistics, group comparison, patterns or outliers, data quality checks, codebook creation, and a freeform option.',
+					'If the request intent is data analysis and the stage is goal-clarity, ask what the user wants to learn, decide, or communicate with the analysis. Audience and helpful data context are strong follow-up topics when question budget allows.',
 					'If the request intent is script work, lead with the script, entrypoint, or runtime context that matters most.',
 					requestedQuestionCount > 1 ? 'For goal-clarity, prefer at least one structured choice question plus one open text question unless the context is genuinely too ambiguous.' : '',
 					context.questionStage === 'task-decomposition' ? 'For task-decomposition, prefer a structured work-breakdown or insertion-point question and avoid drifting back into abstract scope questions.' : '',
@@ -132,6 +143,7 @@ export async function generateDynamicPlanningQuestionsResult(
 					'Descriptions should be concise and help the user understand why the question matters.',
 					'Do not repeat the same question theme across both stages.',
 					context.shouldConfirmPlanningTarget ? 'If the concrete file, folder, or subsystem is still ambiguous, use one sharply-targeted question to pin it down inside the current workspace.' : '',
+					'Do not say or imply that the user has an existing workflow unless the user or repository context explicitly describes one.',
 					'Return JSON only with the shape {"questions":[...]} and no markdown.'
 				].join(' ')
 			}]
@@ -491,12 +503,16 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 		context.questionStage === 'goal-clarity'
 			? `Return exactly ${requestedQuestionCount} questions that clarify the implementation goal, constraints, non-goals, and what success looks like before the first plan is built.`
 			: context.questionStage === 'task-decomposition'
-				? `Return exactly ${requestedQuestionCount} questions that tighten the first plan into a stronger work breakdown, insertion-point choice, repo slice, and validation path. At least two questions should hook into concrete files, steps, dependencies, or validation targets already named in the current plan or task lens.`
+				? context.currentPlan
+					? `Return exactly ${requestedQuestionCount} questions that tighten the first plan into a stronger work breakdown, insertion-point choice, repo slice, and validation path. At least two questions should hook into concrete files, steps, dependencies, or validation targets already named in the current plan or task lens.`
+					: `Return exactly ${requestedQuestionCount} questions that help the user co-create the high-level plan before the first detailed plan is built. Cover the major work areas, ordering, scope boundaries, and validation approach without getting into low-level implementation minutiae.`
 				: `Return exactly ${requestedQuestionCount} questions that zoom in on one specific aspect of the rebuilt plan using the named focus area, the latest plan text, and the narrowed repo context.`,
 		context.questionStage === 'goal-clarity'
 			? 'Prefer a light but engaging pre-planning UX: the questions should feel closer to ask-questions than a heavy middleware banner.'
 			: context.questionStage === 'task-decomposition'
-				? 'Prefer a concrete refinement UX: one question should usually lock in work breakdown, insertion point, file or repo slice, or validation.'
+				? context.currentPlan
+					? 'Prefer a concrete refinement UX: one question should usually lock in work breakdown, insertion point, file or repo slice, or validation.'
+					: 'Prefer a collaborative plan-shaping UX: use checkable choices where possible so the user can quickly confirm, reject, or add work areas before seeing a full plan.'
 				: 'Prefer a focused refinement UX: the questions should feel like a zoom-in on one part of the plan, not a restart of the whole plan. When possible, cover the exact repo slice, the key unresolved decision, and the evidence or validation needed for that focused change.',
 		'Avoid generic project-management questions.',
 		'Do not ask for information that is already clear from the repo context, current plan, or earlier answers.',
@@ -509,8 +525,11 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 		context.questionStage === 'goal-clarity'
 			? 'Do not ask sequencing or implementation-order questions unless they are necessary to understand the goal.'
 			: context.questionStage === 'task-decomposition'
-				? 'Do not repeat goal-clarity questions that are already answered in the planning context.'
+				? context.currentPlan
+					? 'Do not repeat goal-clarity questions that are already answered in the planning context.'
+					: 'Do not ask the user to approve a plan that does not exist yet. Ask which high-level work areas and ordering choices should shape the first plan.'
 				: 'Do not drift back into broad decomposition or restart the plan from scratch.',
+		context.questionStage === 'task-decomposition' && !context.currentPlan ? 'Include one assumption-confirmation question so the user can quickly confirm, reject, or refine what the first plan will assume.' : '',
 		context.shouldConfirmPlanningTarget ? 'Do not ask the user to confirm the primary repo target again; that is being collected separately.' : '',
 		'For singleSelect and multiSelect questions, defaultValue must reference the option label.'
 	].join(' '));
@@ -677,12 +696,188 @@ function extractFileLikeMentions(value: string | undefined): string[] {
 	return value.match(/(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g) ?? [];
 }
 
+function isDataAnalysisGoalClarityContext(context: IPlanningQuestionGenerationContext): boolean {
+	return context.questionStage === 'goal-clarity' && context.repositoryContext?.requestIntent === 'data-analysis';
+}
+
+function isInitialTaskDecompositionContext(context: IPlanningQuestionGenerationContext): boolean {
+	return context.questionStage === 'task-decomposition' && !context.currentPlan?.trim();
+}
+
+function addSupplementalPlanningQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
+	return addInitialPlanShapingQuestions(addDataAnalysisGoalQuestions(questions, context), context);
+}
+
+function addDataAnalysisGoalQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
+	if (!isDataAnalysisGoalClarityContext(context)) {
+		return [...questions];
+	}
+
+	const enriched = [...questions];
+	for (const candidate of createDataAnalysisGoalQuestions(context)) {
+		if (enriched.some(existing => isSimilarDataAnalysisQuestion(existing, candidate))) {
+			continue;
+		}
+
+		enriched.push(candidate);
+	}
+
+	return enriched;
+}
+
+function addInitialPlanShapingQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
+	if (!isInitialTaskDecompositionContext(context)) {
+		return [...questions];
+	}
+
+	const assumptionQuestion = createInitialPlanAssumptionQuestion(context);
+	if (questions.some(question => isPlanAssumptionQuestion(question) || computeOverlap(normalizeQuestionPrompt(question), normalizeQuestionPrompt(assumptionQuestion)) >= 0.42)) {
+		return [...questions];
+	}
+
+	return [assumptionQuestion, ...questions];
+}
+
+function createInitialPlanAssumptionQuestion(context: IPlanningQuestionGenerationContext): IChatQuestion {
+	const taskLens = context.repositoryContext?.taskLens;
+	const options: { id: string; label: string; value: string }[] = [];
+	const seen = new Set<string>();
+	const pushOption = (label: string, value: string) => {
+		const normalized = label.replace(/\s+/g, ' ').trim();
+		const key = normalized.toLowerCase();
+		if (!normalized || seen.has(key)) {
+			return;
+		}
+
+		seen.add(key);
+		options.push({
+			id: `plan-assumption-${options.length}`,
+			label: normalized,
+			value,
+		});
+	};
+
+	const primaryTarget = taskLens?.primaryArtifact ?? context.repositoryContext?.primaryArtifactHint ?? context.repositoryContext?.planningTarget?.label;
+	if (primaryTarget && isConcretePlanningArtifactReference(primaryTarget)) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionPrimaryTarget', 'Use {0} as the primary target', primaryTarget), `primary-target:${primaryTarget}`);
+	}
+
+	if (taskLens?.desiredOutcome) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionOutcome', 'Optimize the plan for: {0}', taskLens.desiredOutcome), `outcome:${taskLens.desiredOutcome}`);
+	}
+
+	const relatedArtifacts = taskLens?.secondaryArtifacts ?? context.repositoryContext?.relatedArtifactHints;
+	if (relatedArtifacts?.length) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionRelatedArtifacts', 'Treat {0} as supporting context, not extra scope unless needed', relatedArtifacts.slice(0, 2).join(', ')), `supporting-context:${relatedArtifacts.slice(0, 2).join(', ')}`);
+	}
+
+	if (taskLens?.validationTargets?.length) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionValidation', 'Reserve validation for {0}', taskLens.validationTargets.slice(0, 2).join(', ')), `validation:${taskLens.validationTargets.slice(0, 2).join(', ')}`);
+	}
+
+	pushOption(localize('chat.dynamicPlanning.planAssumptionStatedGoal', 'Keep the plan focused on the stated goal'), 'stated-goal');
+	pushOption(localize('chat.dynamicPlanning.planAssumptionWorkspaceBoundary', 'Use the current workspace context as the boundary'), 'workspace-boundary');
+	pushOption(localize('chat.dynamicPlanning.planAssumptionValidationFallback', 'Include a lightweight validation step'), 'lightweight-validation');
+
+	const trimmedOptions = options.slice(0, 5);
+	return {
+		id: 'dynamic-planning-plan-assumptions',
+		type: 'multiSelect',
+		title: localize('chat.dynamicPlanning.planAssumptionTitle', 'Plan Assumptions'),
+		message: localize('chat.dynamicPlanning.planAssumptionMessage', 'Which assumptions should shape the first plan?'),
+		description: localize('chat.dynamicPlanning.planAssumptionDescription', 'Confirm the assumptions that fit, or add corrections.'),
+		required: false,
+		allowFreeformInput: true,
+		options: trimmedOptions,
+		defaultValue: trimmedOptions.map(option => option.id),
+	};
+}
+
+function createDataAnalysisGoalQuestions(context: IPlanningQuestionGenerationContext): IChatQuestion[] {
+	const target = context.repositoryContext?.taskLens?.primaryArtifact ?? context.repositoryContext?.primaryArtifactHint;
+	const targetDescription = target && isConcretePlanningArtifactReference(target)
+		? localize('chat.dynamicPlanning.analysisKindDescriptionWithTarget', 'Select any that fit for {0}, or add your own.', target)
+		: localize('chat.dynamicPlanning.analysisKindDescription', 'Select any that fit, or add your own.');
+
+	return [
+		{
+			id: 'dynamic-planning-analysis-kind',
+			type: 'multiSelect',
+			title: localize('chat.dynamicPlanning.analysisKindTitle', 'Analysis Type'),
+			message: localize('chat.dynamicPlanning.analysisKindMessage', 'What kind of analysis are you looking to do?'),
+			description: targetDescription,
+			required: true,
+			allowFreeformInput: true,
+			options: [
+				{ id: 'summary-statistics', label: localize('chat.dynamicPlanning.analysisKindSummaryStatistics', 'Summary Statistics'), value: 'summary-statistics' },
+				{ id: 'group-comparison', label: localize('chat.dynamicPlanning.analysisKindGroupComparison', 'Compare Groups or Segments'), value: 'group-comparison' },
+				{ id: 'patterns-outliers', label: localize('chat.dynamicPlanning.analysisKindPatternsOutliers', 'Find Patterns or Outliers'), value: 'patterns-outliers' },
+				{ id: 'data-quality', label: localize('chat.dynamicPlanning.analysisKindDataQuality', 'Check Data Quality'), value: 'data-quality' },
+				{ id: 'codebook', label: localize('chat.dynamicPlanning.analysisKindCodebook', 'Create or Update a Codebook'), value: 'codebook' },
+			],
+		},
+		{
+			id: 'dynamic-planning-analysis-goal',
+			type: 'text',
+			title: localize('chat.dynamicPlanning.analysisGoalTitle', 'Analysis Goal'),
+			message: localize('chat.dynamicPlanning.analysisGoalMessage', 'What do you want to learn, decide, or communicate with this analysis?'),
+			description: localize('chat.dynamicPlanning.analysisGoalDescription', 'A short research question, decision, or desired takeaway is enough.'),
+			required: true,
+			allowFreeformInput: true,
+		},
+		{
+			id: 'dynamic-planning-analysis-audience',
+			type: 'singleSelect',
+			title: localize('chat.dynamicPlanning.analysisAudienceTitle', 'Audience'),
+			message: localize('chat.dynamicPlanning.analysisAudienceMessage', 'Who is this analysis for?'),
+			required: false,
+			allowFreeformInput: true,
+			options: [
+				{ id: 'just-me', label: localize('chat.dynamicPlanning.analysisAudienceJustMe', 'Just Me'), value: 'just-me' },
+				{ id: 'technical-collaborators', label: localize('chat.dynamicPlanning.analysisAudienceTechnicalCollaborators', 'Technical Collaborators'), value: 'technical-collaborators' },
+				{ id: 'nontechnical-stakeholders', label: localize('chat.dynamicPlanning.analysisAudienceNontechnicalStakeholders', 'Nontechnical Stakeholders'), value: 'nontechnical-stakeholders' },
+			],
+		},
+		{
+			id: 'dynamic-planning-analysis-context',
+			type: 'text',
+			title: localize('chat.dynamicPlanning.analysisContextTitle', 'Data Context'),
+			message: localize('chat.dynamicPlanning.analysisContextMessage', 'What context about the data should shape the analysis?'),
+			description: localize('chat.dynamicPlanning.analysisContextDescription', 'Mention caveats, definitions, filters, or known issues that would change the plan.'),
+			required: false,
+			allowFreeformInput: true,
+		},
+	];
+}
+
+function isSimilarDataAnalysisQuestion(existing: IChatQuestion, candidate: IChatQuestion): boolean {
+	const existingPrompt = normalizeQuestionPrompt(existing);
+	const candidatePrompt = normalizeQuestionPrompt(candidate);
+	if (computeOverlap(existingPrompt, candidatePrompt) >= 0.42) {
+		return true;
+	}
+
+	switch (candidate.id) {
+		case 'dynamic-planning-analysis-kind':
+			return isAnalysisKindQuestion(existing);
+		case 'dynamic-planning-analysis-goal':
+			return isAnalysisGoalQuestion(existing);
+		case 'dynamic-planning-analysis-audience':
+			return isAnalysisAudienceQuestion(existing);
+		case 'dynamic-planning-analysis-context':
+			return isAnalysisContextQuestion(existing);
+		default:
+			return false;
+	}
+}
+
 function finalizeGeneratedQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
 	const requestedQuestionCount = clampRequestedQuestionCount(context.questionCount);
 	const deduped = dedupeQuestionsByPrompt(questions);
-	const stageFiltered = context.questionStage === 'goal-clarity'
+	const stageCandidates = context.questionStage === 'goal-clarity'
 		? deduped
 		: deduped.filter(question => !isOverlappingGoalClarityQuestion(question, context.planningAnswers));
+	const stageFiltered = dedupeQuestionsByPrompt(addSupplementalPlanningQuestions(stageCandidates, context));
 	if (stageFiltered.length < requestedQuestionCount) {
 		return [];
 	}
@@ -731,6 +926,14 @@ function selectQuestionsWithStageMix(
 		return rankedQuestions.slice(0, 1);
 	}
 
+	if (isDataAnalysisGoalClarityContext(context)) {
+		return selectDataAnalysisGoalQuestions(rankedQuestions, requestedQuestionCount, context);
+	}
+
+	if (isInitialTaskDecompositionContext(context)) {
+		return selectInitialPlanShapingQuestions(rankedQuestions, requestedQuestionCount);
+	}
+
 	const requireTextAndStructured = context.questionStage === 'goal-clarity' || (context.questionStage === 'plan-focus' && requestedQuestionCount > 2);
 	if (!requireTextAndStructured) {
 		return rankedQuestions.slice(0, requestedQuestionCount);
@@ -763,6 +966,122 @@ function selectQuestionsWithStageMix(
 	}
 
 	return selected;
+}
+
+function selectDataAnalysisGoalQuestions(
+	rankedQuestions: readonly IChatQuestion[],
+	requestedQuestionCount: number,
+	context: IPlanningQuestionGenerationContext,
+): IChatQuestion[] {
+	const taskLens = context.repositoryContext?.taskLens;
+	const hasConcretePrimaryArtifact = isConcretePlanningArtifactReference(taskLens?.primaryArtifact)
+		|| isConcretePlanningArtifactReference(context.repositoryContext?.primaryArtifactHint);
+	const hasUnresolvedPrimaryArtifact = !hasConcretePrimaryArtifact && !!context.repositoryContext?.primaryArtifactHint;
+	const selected: IChatQuestion[] = [];
+	const seen = new Set<string>();
+	const pushQuestion = (question: IChatQuestion | undefined) => {
+		if (!question || seen.has(question.id)) {
+			return;
+		}
+
+		seen.add(question.id);
+		selected.push(question);
+	};
+
+	if (hasUnresolvedPrimaryArtifact) {
+		pushQuestion(rankedQuestions.find(isArtifactTargetingQuestion));
+	}
+
+	pushQuestion(rankedQuestions.find(isAnalysisKindQuestion));
+	pushQuestion(rankedQuestions.find(isAnalysisGoalQuestion));
+	pushQuestion(rankedQuestions.find(isAnalysisAudienceQuestion));
+	pushQuestion(rankedQuestions.find(isAnalysisContextQuestion));
+
+	for (const question of rankedQuestions) {
+		pushQuestion(question);
+		if (selected.length >= requestedQuestionCount) {
+			break;
+		}
+	}
+
+	return selected.slice(0, requestedQuestionCount);
+}
+
+function selectInitialPlanShapingQuestions(rankedQuestions: readonly IChatQuestion[], requestedQuestionCount: number): IChatQuestion[] {
+	const selected: IChatQuestion[] = [];
+	const seen = new Set<string>();
+	const pushQuestion = (question: IChatQuestion | undefined) => {
+		if (!question || seen.has(question.id)) {
+			return;
+		}
+
+		seen.add(question.id);
+		selected.push(question);
+	};
+
+	pushQuestion(rankedQuestions.find(isPlanAssumptionQuestion));
+	pushQuestion(rankedQuestions.find(question => question.type !== 'text' && !isPlanAssumptionQuestion(question)));
+	pushQuestion(rankedQuestions.find(question => question.type === 'text'));
+	for (const question of rankedQuestions) {
+		pushQuestion(question);
+		if (selected.length >= requestedQuestionCount) {
+			break;
+		}
+	}
+
+	return selected.slice(0, requestedQuestionCount);
+}
+
+function isPlanAssumptionQuestion(question: IChatQuestion): boolean {
+	if (question.id === 'dynamic-planning-plan-assumptions') {
+		return true;
+	}
+
+	return /\b(assumption|assumptions|confirm.*plan|shape.*first plan|first plan.*assume)\b/i.test(normalizeQuestionPrompt(question));
+}
+
+function isArtifactTargetingQuestion(question: IChatQuestion): boolean {
+	const prompt = normalizeQuestionPrompt(question);
+	return /\b(which|what)\b.{0,60}\b(file|folder|directory|dataset|csv|tsv|json|schema|table|notebook)\b/i.test(prompt)
+		|| /\b(primary|exact|target|anchor)\b.{0,60}\b(file|folder|directory|dataset|csv|tsv|json|schema|table|notebook)\b/i.test(prompt);
+}
+
+function isAnalysisKindQuestion(question: IChatQuestion): boolean {
+	if (question.id === 'dynamic-planning-analysis-kind') {
+		return true;
+	}
+
+	const prompt = normalizeQuestionPrompt(question);
+	return /\b(kind|type|approach)\b.{0,60}\banalys/i.test(prompt)
+		|| /\b(summary statistics|group comparison|segments?|patterns?|outliers?|data quality|codebook)\b/i.test(prompt);
+}
+
+function isAnalysisGoalQuestion(question: IChatQuestion): boolean {
+	if (question.id === 'dynamic-planning-analysis-goal') {
+		return true;
+	}
+
+	const prompt = normalizeQuestionPrompt(question);
+	return /\b(learn|decide|communicate|research question|question|takeaway|want to know|goal|outcome)\b/i.test(prompt)
+		&& /\banalys/i.test(prompt);
+}
+
+function isAnalysisAudienceQuestion(question: IChatQuestion): boolean {
+	if (question.id === 'dynamic-planning-analysis-audience') {
+		return true;
+	}
+
+	const prompt = normalizeQuestionPrompt(question);
+	return /\b(audience|stakeholder|reader|recipient|for whom|who is this)\b/i.test(prompt);
+}
+
+function isAnalysisContextQuestion(question: IChatQuestion): boolean {
+	if (question.id === 'dynamic-planning-analysis-context') {
+		return true;
+	}
+
+	const prompt = normalizeQuestionPrompt(question);
+	return /\b(data context|caveat|definition|filter|known issue|quality issue|assumption|context about the data)\b/i.test(prompt);
 }
 
 function clampRequestedQuestionCount(questionCount: number | undefined): number {

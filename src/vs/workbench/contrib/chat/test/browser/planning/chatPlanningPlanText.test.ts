@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { MarkdownString } from '../../../../../../base/common/htmlContent.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
-import { extractPlanningPlanText, summarizePlanningPlanChanges } from '../../../browser/planning/chatPlanningPlanText.js';
+import { extractPlanningPlanSteps, extractPlanningPlanText, summarizePlanningPlanChanges } from '../../../browser/planning/chatPlanningPlanText.js';
 import { Response } from '../../../common/model/chatModel.js';
 
 suite('ChatPlanningPlanText', () => {
@@ -89,4 +89,79 @@ suite('ChatPlanningPlanText', () => {
 			removed: []
 		});
 	});
+
+	test('extracts editable plan steps from steps and verification sections', () => {
+		const steps = extractPlanningPlanSteps([
+			'## Plan: Analyze Orders CSV',
+			'',
+			'**Relevant Files**',
+			'- `orders.csv`',
+			'- `schema.json`',
+			'',
+			'**Steps**',
+			'1. Load `orders.csv` into pandas.',
+			'   - Preserve the original column names.',
+			'2. Validate the columns against `schema.json`.',
+			'3. Produce a concise markdown summary.',
+			'',
+			'**Verification**',
+			'- Confirm the expected columns are present.',
+		].join('\n'));
+
+		assert.deepStrictEqual(steps.map(step => ({
+			label: step.label,
+			kind: step.kind,
+			sectionTitle: step.sectionTitle,
+			text: step.text,
+		})), [
+			{
+				label: 'Load `orders.csv` into pandas.',
+				kind: 'step',
+				sectionTitle: 'Steps',
+				text: [
+					'Load `orders.csv` into pandas.',
+					'- Preserve the original column names.',
+				].join('\n'),
+			},
+			{
+				label: 'Validate the columns against `schema.json`.',
+				kind: 'step',
+				sectionTitle: 'Steps',
+				text: 'Validate the columns against `schema.json`.',
+			},
+			{
+				label: 'Produce a concise markdown summary.',
+				kind: 'step',
+				sectionTitle: 'Steps',
+				text: 'Produce a concise markdown summary.',
+			},
+			{
+				label: 'Confirm the expected columns are present.',
+				kind: 'verification',
+				sectionTitle: 'Verification',
+				text: 'Confirm the expected columns are present.',
+			},
+		]);
+	});
+
+	test('extracts top-level list items when a plan has no explicit steps heading', () => {
+		const steps = extractPlanningPlanSteps([
+			'## Plan',
+			'',
+			'1. Inspect the current middleware flow.',
+			'2. Add a bounded plan review carousel.',
+			'   1. Keep nested details with the parent step.',
+			'3. Run the planning tests.',
+		].join('\n'));
+
+		assert.deepStrictEqual(steps.map(step => step.text), [
+			'Inspect the current middleware flow.',
+			[
+				'Add a bounded plan review carousel.',
+				'1. Keep nested details with the parent step.',
+			].join('\n'),
+			'Run the planning tests.',
+		]);
+	});
+
 });

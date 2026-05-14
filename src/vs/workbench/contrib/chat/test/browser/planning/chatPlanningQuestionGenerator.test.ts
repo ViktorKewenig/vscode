@@ -167,6 +167,116 @@ suite('ChatPlanningQuestionGenerator', () => {
 		assert.ok(promptPart.value.includes('Missing planning dimensions:\nconstraints'));
 	});
 
+	test('uses task decomposition to generate inline questions for an existing plan', async () => {
+		let capturedMessages: IChatMessage[] | undefined;
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['plan-model'],
+			getVendors: () => [],
+			lookupLanguageModel: () => ({ capabilities: { toolCalling: true } }),
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async () => [],
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async (_modelId: string, _from: unknown, messages: IChatMessage[]) => {
+				capturedMessages = messages;
+				return {
+					stream: (async function* () {
+						yield {
+							type: 'text' as const,
+							value: JSON.stringify({
+								questions: [
+									{
+										title: 'Plan Step Priority',
+										message: 'Which current plan steps should be handled first?',
+										type: 'multiSelect',
+										options: [
+											{ label: 'Update chatWidget transition', value: 'Update chatWidget transition' },
+											{ label: 'Embed step questions', value: 'Embed step questions' },
+											{ label: 'Run planning tests', value: 'Run planning tests' }
+										]
+									},
+									{
+										title: 'Validation Approach',
+										message: 'What validation should this plan require after the UI changes?',
+										type: 'text',
+										required: true
+									}
+								]
+							})
+						};
+					})(),
+					result: Promise.resolve({})
+				};
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		const questions = await generateDynamicPlanningQuestions(service, {
+			userRequest: 'Plan a better planning middleware handoff.',
+			modelId: undefined,
+			planningPhase: 'focused-slice',
+			questionStage: 'task-decomposition',
+			questionCount: 2,
+			currentPlan: [
+				'## Plan',
+				'1. Update chatWidget transition so goal clarity answers stream the first plan immediately.',
+				'2. Embed generated refinement questions into the plan editor steps.',
+				'3. Run ChatPlanning tests and smoke launch Code OSS.'
+			].join('\n'),
+			recentConversation: [],
+			planningAnswers: [{ question: 'Clarifying Your Goals', answer: 'Make the plan easier to refine before implementation.' }],
+			repositoryContext: {
+				scope: 'focused',
+				workspaceRoot: 'file:///workspace',
+				planningTarget: { kind: 'file', label: 'src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts', confidence: 'high' },
+				requestIntent: 'feature-work',
+				taskLens: {
+					taskKind: 'feature-work',
+					taskSummary: 'Improve planning middleware handoff.',
+					primaryArtifact: 'src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts',
+					artifactType: 'file',
+					desiredOutcome: 'Shape the first plan with user input before implementation starts.',
+					deliverableType: 'code-change',
+					planAreas: ['Question flow', 'Plan handoff'],
+					validationTargets: ['Planning tests'],
+				},
+				primaryArtifactHint: 'src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts',
+				focusQueries: ['planning', 'chatWidget'],
+				workspaceFolders: ['workspace'],
+				workingSetFiles: ['src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts'],
+				activeDocumentSymbols: [],
+				workspaceSymbolMatches: [],
+				nearbyFiles: [],
+				relevantSnippets: [],
+			}
+		}, CancellationToken.None);
+
+		assert.strictEqual(questions.length, 2);
+		assert.strictEqual(questions[0].type, 'multiSelect');
+		assert.strictEqual(questions[0].title, 'Plan Step Priority');
+		assert.ok(capturedMessages, 'Expected a language-model request to be issued');
+		const promptPart = capturedMessages[1].content[0];
+		if (promptPart.type !== 'text') {
+			throw new Error('Expected prompt text part');
+		}
+		assert.ok(promptPart.value.includes('Current plan:\n## Plan'));
+		assert.ok(promptPart.value.includes('Current plan anchors:'));
+		assert.ok(promptPart.value.includes('tighten the first plan into a stronger work breakdown'));
+		assert.ok(!promptPart.value.includes('co-create the high-level plan before the first detailed plan is built'));
+		assert.ok(!promptPart.value.includes('Include one assumption-confirmation question'));
+	});
+
 	test('ranks task-lens-aligned questions ahead of generic repo questions', async () => {
 		const service = {
 			_serviceBrand: undefined,
@@ -261,8 +371,9 @@ suite('ChatPlanningQuestionGenerator', () => {
 
 		assert.strictEqual(questions.length, 3);
 		assert.ok(questions.every(question => !/repository/i.test(question.title)));
-		assert.ok(questions.some(question => /orders\.csv/i.test(typeof question.message === 'string' ? question.message : '')));
-		assert.ok(questions.some(question => /schema\.json/i.test(typeof question.message === 'string' ? question.message : '')));
+		assert.ok(questions.some(question => question.id === 'dynamic-planning-analysis-kind' && question.type === 'multiSelect'));
+		assert.ok(questions.some(question => question.id === 'dynamic-planning-analysis-goal' && question.type === 'text'));
+		assert.ok(questions.some(question => question.id === 'dynamic-planning-analysis-audience' && question.type === 'singleSelect'));
 	});
 
 	test('does not inject a static planning-target confirmation question', async () => {
@@ -674,6 +785,7 @@ suite('ChatPlanningQuestionGenerator', () => {
 
 		assert.strictEqual(questions.length, 2);
 		assert.strictEqual(questions[0].message, 'Which CSV file or directory should anchor the analysis?');
+		assert.strictEqual(questions[1].id, 'dynamic-planning-analysis-kind');
 		assert.ok(capturedMessages, 'Expected a language-model request to be issued');
 		const promptPart = capturedMessages[1].content[0];
 		if (promptPart.type !== 'text') {

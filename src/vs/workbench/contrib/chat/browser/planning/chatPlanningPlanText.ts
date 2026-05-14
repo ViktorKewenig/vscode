@@ -10,10 +10,20 @@ export interface IPlanningPlanChangeSummary {
 	readonly removed: readonly string[];
 }
 
+export type PlanningPlanStepKind = 'step' | 'verification' | 'decision' | 'guardrail' | 'other';
+
+export interface IPlanningPlanStep {
+	readonly index: number;
+	readonly label: string;
+	readonly text: string;
+	readonly sectionTitle?: string;
+	readonly kind: PlanningPlanStepKind;
+}
+
 const planHeadingPattern = /^#{1,6}\s*plan\b.*$/gim;
 const planSectionMarkerPattern = /^(?:\*\*(?:steps|relevant files|verification|decisions)\*\*|#{1,6}\s*(?:steps|verification|decisions)\b)/gim;
 const planningScaffoldingBlockHeadingPattern = /^(?:planning answers:|recent planning conversation:)\s*$/i;
-const planningScaffoldingLinePattern = /^(?:planning context from the previous planning step:|planning phase:|planner notes:|use this planning context as the source of truth\b|do not ignore the planning answers\b|do not re-ask questions\b|user request:|question stage:|requested question count:|active file:|selected text:|missing dimensions:|partial dimensions:|should confirm planning target:|repository context:|scope:|workspace root:|planning target:|request intent:|task lens:|primary artifact hint:|related artifact hints:|focus summary:|focus queries:|workspace folders:|workspace top-level entries:|working set files:|active document symbols:|workspace symbol matches:|nearby files:|relevant snippets:|task kind:|task summary:|primary artifact:|adjacent artifacts:|artifact type:|desired outcome:|expected deliverable:|plan areas:|validation targets:|risks or guardrails:|open decisions:|current plan excerpt:|selected plan slice:|internal focus guidance\b)/i;
+const planningScaffoldingLinePattern = /^(?:planning context from the previous planning step:|planning phase:|planner notes:|use this planning context as the source of truth\b|do not ignore the planning answers\b|do not re-ask questions\b|if you ask follow-up questions\b|treat a confirmed planning target\b|keep upfront verification concise\b|do not describe an existing workflow\b|user request:|question stage:|requested question count:|active file:|selected text:|missing dimensions:|partial dimensions:|should confirm planning target:|repository context:|scope:|workspace root:|planning target:|request intent:|task lens:|primary artifact hint:|related artifact hints:|focus summary:|focus queries:|workspace folders:|workspace top-level entries:|working set files:|active document symbols:|workspace symbol matches:|nearby files:|relevant snippets:|task kind:|task summary:|primary artifact:|adjacent artifacts:|artifact type:|desired outcome:|expected deliverable:|plan areas:|validation targets:|risks or guardrails:|open decisions:|current plan excerpt:|selected plan slice:|internal focus guidance\b)/i;
 
 export function extractPlanningPlanText(response: IResponse | undefined): string | undefined {
 	if (!response) {
@@ -56,6 +66,93 @@ export function normalizePlanningPlanLine(line: string): string | undefined {
 	return normalized.length >= 12 ? normalized : undefined;
 }
 
+export function extractPlanningPlanSteps(planText: string | undefined, maxSteps = 10): readonly IPlanningPlanStep[] {
+	const normalized = normalizePlanText(planText);
+	if (!normalized || maxSteps <= 0) {
+		return [];
+	}
+
+	const steps: IPlanningPlanStep[] = [];
+	const seen = new Set<string>();
+	let currentSectionTitle: string | undefined;
+	let currentSectionKind: PlanningPlanStepKind = 'step';
+	let currentChunk: string[] = [];
+	let currentChunkKind: PlanningPlanStepKind = currentSectionKind;
+	let currentChunkSectionTitle: string | undefined = currentSectionTitle;
+	let inCodeBlock = false;
+
+	const flushChunk = () => {
+		if (currentChunk.length === 0) {
+			return;
+		}
+
+		const text = currentChunk.join('\n').trim();
+		const label = normalizePlanningPlanStepLabel(currentChunk[0]);
+		currentChunk = [];
+		if (!label || !text) {
+			return;
+		}
+
+		const key = `${currentChunkKind}:${label.toLowerCase()}:${text.toLowerCase()}`;
+		if (seen.has(key) || shouldSkipPlanStepKind(currentChunkKind)) {
+			return;
+		}
+
+		seen.add(key);
+		steps.push({
+			index: steps.length + 1,
+			label,
+			text,
+			sectionTitle: currentChunkSectionTitle,
+			kind: currentChunkKind,
+		});
+	};
+
+	for (const rawLine of normalized.split(/\r?\n/g)) {
+		const trimmed = rawLine.trim();
+		if (/^```/.test(trimmed)) {
+			inCodeBlock = !inCodeBlock;
+			if (currentChunk.length > 0) {
+				currentChunk.push(trimmed);
+			}
+			continue;
+		}
+
+		if (!trimmed) {
+			continue;
+		}
+
+		if (!inCodeBlock) {
+			const heading = parsePlanningPlanSectionHeading(trimmed);
+			if (heading) {
+				flushChunk();
+				currentSectionTitle = heading.title;
+				currentSectionKind = heading.kind;
+				continue;
+			}
+		}
+
+		const topLevelListItem = !inCodeBlock ? parseTopLevelPlanningListItem(rawLine) : undefined;
+		if (topLevelListItem) {
+			flushChunk();
+			currentChunkKind = currentSectionKind;
+			currentChunkSectionTitle = currentSectionTitle;
+			currentChunk.push(topLevelListItem);
+			if (steps.length >= maxSteps) {
+				break;
+			}
+			continue;
+		}
+
+		if (currentChunk.length > 0) {
+			currentChunk.push(trimmed);
+		}
+	}
+
+	flushChunk();
+	return steps.slice(0, maxSteps);
+}
+
 export function summarizePlanningPlanChanges(previousPlanText: string | undefined, currentPlanText: string | undefined): IPlanningPlanChangeSummary | undefined {
 	if (!previousPlanText || !currentPlanText) {
 		return undefined;
@@ -89,6 +186,64 @@ function getPlanningPlanLines(planText: string): string[] {
 	}
 
 	return lines;
+}
+
+function normalizePlanningPlanStepLabel(line: string): string | undefined {
+	const normalized = line
+		.replace(/^\s{0,3}(?:[-*+]|\d+[.)])\s*/, '')
+		.replace(/\s+/g, ' ')
+		.trim();
+	return normalized.length >= 6 ? normalized : undefined;
+}
+
+function shouldSkipPlanStepKind(kind: PlanningPlanStepKind): boolean {
+	return kind === 'other';
+}
+
+function parsePlanningPlanSectionHeading(line: string): { readonly title: string; readonly kind: PlanningPlanStepKind } | undefined {
+	const headingMatch = /^(?:#{1,6}\s+|\*\*)(.+?)(?:\*\*)?\s*:?\s*$/.exec(line);
+	const title = headingMatch?.[1]?.replace(/#+\s*$/, '').trim();
+	if (!title) {
+		return undefined;
+	}
+
+	if (/^plan\b/i.test(title)) {
+		return undefined;
+	}
+
+	return {
+		title,
+		kind: getPlanningPlanSectionKind(title),
+	};
+}
+
+function getPlanningPlanSectionKind(title: string): PlanningPlanStepKind {
+	if (/\b(step|steps|implementation|approach|tasks?|work plan|execution)\b/i.test(title)) {
+		return 'step';
+	}
+
+	if (/\b(verification|validate|validation|tests?|checks?|qa)\b/i.test(title)) {
+		return 'verification';
+	}
+
+	if (/\b(decisions?|questions?|open items?|clarifications?)\b/i.test(title)) {
+		return 'decision';
+	}
+
+	if (/\b(risks?|guardrails?|constraints?|assumptions?)\b/i.test(title)) {
+		return 'guardrail';
+	}
+
+	if (/\b(relevant files?|files?|context|references?|dependencies?)\b/i.test(title)) {
+		return 'other';
+	}
+
+	return 'step';
+}
+
+function parseTopLevelPlanningListItem(line: string): string | undefined {
+	const match = /^\s{0,2}(?:[-*+]|\d+[.)])\s+(.+)$/.exec(line);
+	return match?.[1]?.trim();
 }
 
 function getMarkdownCandidate(part: IResponse['value'][number]): string | undefined {

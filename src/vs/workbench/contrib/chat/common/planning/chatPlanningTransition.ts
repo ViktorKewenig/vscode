@@ -241,6 +241,9 @@ export function augmentPromptWithPlanningContext(basePrompt: string, context: IP
 	planningSections.push('Do not ignore the planning answers. Use them to shape scope, task selection, sequencing, and validation in the next plan.');
 	planningSections.push('Do not re-ask questions that the planning answers already resolved. Only ask follow-up questions if a decision is still genuinely missing or ambiguous.');
 	planningSections.push('If you ask follow-up questions while gathering more repo context for the first draft, they must be more specific than the earlier goal-clarity questions and should depend on what you just learned from the code or files you inspected.');
+	planningSections.push('Treat a confirmed planning target as the primary artifact. Do not expand the plan to extra CSVs, data files, sibling artifacts, or adjacent files unless the user named them or repository context makes the dependency explicit; call out any such expansion as an assumption.');
+	planningSections.push('Keep upfront verification concise and agent-facing. Do not front-load long user verification checklists before implementation; save user-facing checks for after execution unless the user asked for them.');
+	planningSections.push('Do not describe an existing workflow unless the user or repository context explicitly established one.');
 	const planningBlock = ['Planning context from the previous planning step:', ...planningSections].join('\n');
 
 	return prompt ? `${prompt}\n\n${planningBlock}` : planningBlock;

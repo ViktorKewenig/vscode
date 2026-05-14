@@ -66,6 +66,9 @@ suite('ChatPlanningTransition', () => {
 		assert.ok(prompt.includes('- Constraints: Keep changes localized to chat planning'));
 		assert.ok(prompt.includes('Planning target: src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts (file, high confidence)'));
 		assert.ok(prompt.includes('Workspace top-level entries: src, extensions, build'));
+		assert.ok(prompt.includes('Treat a confirmed planning target as the primary artifact.'));
+		assert.ok(prompt.includes('Keep upfront verification concise and agent-facing.'));
+		assert.ok(prompt.includes('Do not describe an existing workflow unless the user or repository context explicitly established one.'));
 	});
 
 	test('merges planning contexts without duplicating the same question', () => {

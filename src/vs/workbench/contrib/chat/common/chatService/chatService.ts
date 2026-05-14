@@ -311,6 +311,25 @@ export interface IChatCommandButton {
 	additionalCommands?: Command[]; // rendered as secondary buttons
 }
 
+export interface IChatPlanningPlanEditorStep {
+	id: string;
+	index: number;
+	label: string;
+	text: string;
+	sectionTitle?: string;
+	kind: 'step' | 'verification' | 'decision' | 'guardrail' | 'other';
+	questions?: IChatQuestion[];
+}
+
+export interface IChatPlanningPlanEditor {
+	kind: 'planningPlanEditor';
+	planText: string;
+	steps: IChatPlanningPlanEditorStep[];
+	resolveId?: string;
+	data?: IChatQuestionAnswers;
+	isUsed?: boolean;
+}
+
 export interface IChatMoveMessage {
 	uri: URI;
 	range: IRange;
@@ -1027,6 +1046,7 @@ export type IChatProgress =
 	| IChatTask
 	| IChatTaskResult
 	| IChatCommandButton
+	| IChatPlanningPlanEditor
 	| IChatWarningMessage
 	| IChatTextEdit
 	| IChatNotebookEdit
