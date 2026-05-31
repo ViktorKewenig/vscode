@@ -102,6 +102,11 @@
 			font-size: var(--vscode-chat-font-size-body-s);
 			margin: 0;
 
+			.chat-question-required {
+				margin-left: 3px;
+				color: var(--vscode-inputValidation-errorForeground);
+			}
+
 			.rendered-markdown {
 				a {
 					color: var(--vscode-textLink-foreground);

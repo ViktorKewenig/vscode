@@ -8,7 +8,7 @@
 	border-radius: 6px;
 	background: var(--vscode-editor-background);
 	margin: 8px 0 12px;
-	padding: 10px;
+	padding: 12px;
 	color: var(--vscode-foreground);
 }
 
@@ -33,14 +33,18 @@
 .chat-planning-plan-editor-steps {
 	display: flex;
 	flex-direction: column;
-	gap: 8px;
+	gap: 10px;
 }
 
 .chat-planning-plan-editor-step {
 	border: 1px solid var(--vscode-editorWidget-border);
 	border-radius: 6px;
-	padding: 8px;
+	padding: 10px;
 	background: var(--vscode-sideBar-background);
+}
+
+.chat-planning-plan-editor-step:focus-within {
+	border-color: var(--vscode-focusBorder);
 }
 
 .chat-planning-plan-editor-step-header {
@@ -84,6 +88,7 @@
 	font-weight: 600;
 	line-height: 1.35;
 	overflow-wrap: anywhere;
+	color: var(--vscode-descriptionForeground);
 }
 
 .chat-planning-plan-editor-step-questions {
@@ -147,7 +152,7 @@
 	background: var(--vscode-input-background);
 	color: var(--vscode-input-foreground);
 	padding: 5px 7px;
-	font-family: var(--vscode-font-family);
+	font-family: inherit;
 	font-size: 12px;
 	line-height: 1.4;
 }
@@ -157,22 +162,12 @@
 	width: calc(100% - 32px);
 }
 
-.chat-planning-plan-editor-additional {
-	margin-top: 10px;
-}
-
-.chat-planning-plan-editor-label {
-	display: block;
-	margin-bottom: 4px;
-	font-weight: 600;
-	font-size: 12px;
-}
-
 .chat-planning-plan-editor-footer {
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
 	margin-top: 10px;
+	flex-wrap: wrap;
 }
 
 .chat-planning-plan-editor-used {

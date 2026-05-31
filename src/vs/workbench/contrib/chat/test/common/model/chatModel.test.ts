@@ -167,6 +167,21 @@ suite('ChatModel', () => {
 		assert.strictEqual(request1.response!.shouldBeRemovedOnSend, undefined);
 	});
 
+	test('can replace existing progress message after response completion', async function () {
+		const model = testDisposables.add(instantiationService.createInstance(ChatModel, undefined, { initialLocation: ChatAgentLocation.Chat, canUseTools: true }));
+		const text = 'hello';
+		const request = model.addRequest({ text, parts: [new ChatRequestTextPart(new OffsetRange(0, text.length), new Range(1, text.length, 1, text.length), text)] }, { variables: [] }, 0);
+
+		model.acceptResponseProgress(request, { content: new MarkdownString('progress 95'), kind: 'progressMessage', id: 'planning-plan-progress', isSticky: true });
+		request.response!.complete();
+		model.acceptResponseProgress(request, { content: new MarkdownString('progress 100'), kind: 'progressMessage', id: 'planning-plan-progress', isSticky: true });
+
+		const progress = request.response!.entireResponse.value[0];
+		assert.strictEqual(progress.kind, 'progressMessage');
+		assert.strictEqual(progress.kind === 'progressMessage' ? progress.content.value : undefined, 'progress 100');
+		assert.throws(() => model.acceptResponseProgress(request, { content: new MarkdownString('new progress'), kind: 'progressMessage', id: 'other-progress' }), /Adding progress to a completed response/);
+	});
+
 	test('deserialization marks unused question carousels as used', async () => {
 		const serializableData: ISerializableChatData3 = {
 			version: 3,
@@ -341,6 +356,21 @@ suite('Response', () => {
 		response.updateContent({ content: md1, kind: 'markdownContent' });
 		response.updateContent({ content: new MarkdownString('markdown2'), kind: 'markdownContent' });
 		await assertSnapshot(response.value);
+	});
+
+	test('sticky progress messages update in place at the top of a response', () => {
+		const response = store.add(new Response([]));
+		response.updateContent({ content: new MarkdownString('response body'), kind: 'markdownContent' });
+		response.updateContent({ content: new MarkdownString('progress 10'), kind: 'progressMessage', id: 'planning-plan-progress', isSticky: true });
+		response.updateContent({ content: new MarkdownString('progress 20'), kind: 'progressMessage', id: 'planning-plan-progress', isSticky: true });
+
+		const progress = response.value[0];
+		assert.strictEqual(response.value.length, 2);
+		assert.strictEqual(progress.kind, 'progressMessage');
+		assert.strictEqual(progress.kind === 'progressMessage' ? progress.content.value : undefined, 'progress 20');
+		assert.strictEqual(response.value[1].kind, 'markdownContent');
+		assert.strictEqual(response.getMarkdown(), 'response body');
+		assert.strictEqual(response.toString(), 'response body');
 	});
 
 	test('inline reference', async () => {

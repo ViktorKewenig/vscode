@@ -58,6 +58,7 @@ import { chatSubcommandLeader } from '../../common/requestParser/chatParserTypes
 import { ChatAgentVoteDirection, ChatAgentVoteDownReason, ChatErrorLevel, ChatRequestQueueKind, IChatConfirmation, IChatContentReference, IChatDisabledClaudeHooksPart, IChatElicitationRequest, IChatElicitationRequestSerialized, IChatExtensionsContent, IChatFollowup, IChatHookPart, IChatMarkdownContent, IChatMcpServersStarting, IChatMcpServersStartingSerialized, IChatMultiDiffData, IChatMultiDiffDataSerialized, IChatPlanningPlanEditor, IChatPullRequestContent, IChatQuestionAnswerValue, IChatQuestionAnswers, IChatQuestionCarousel, IChatService, IChatTask, IChatTaskSerialized, IChatThinkingPart, IChatToolInvocation, IChatToolInvocationSerialized, IChatTreeData, IChatUndoStop, isChatFollowup } from '../../common/chatService/chatService.js';
 import { ChatQuestionCarouselData } from '../../common/model/chatProgressTypes/chatQuestionCarouselData.js';
 import { isPlanningMiddlewareQuestionCarousel } from '../../common/planning/chatPlanningTransition.js';
+import { findPlanningPlanStartOffset } from '../planning/chatPlanningPlanText.js';
 import { localChatSessionType } from '../../common/chatSessionsService.js';
 import { getChatSessionType } from '../../common/model/chatUri.js';
 import { IChatRequestVariableEntry } from '../../common/attachments/chatVariableEntries.js';
@@ -117,6 +118,7 @@ const $ = dom.$;
 
 const COPILOT_USERNAME = 'GitHub Copilot';
 const WORKING_CAUGHT_UP_DEBOUNCE_MS = 50;
+const planningPlanProgressMessageId = 'planning-plan-progress';
 
 export interface IChatListItemTemplate {
 	currentElement?: ChatTreeItem;
@@ -982,6 +984,7 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 	}
 
 	private renderChatResponseBasic(element: IChatResponseViewModel, index: number, templateData: IChatListItemTemplate) {
+		templateData.rowContainer.classList.toggle('hidden-complete-added-request', false);
 		templateData.rowContainer.classList.toggle('chat-response-loading', (isResponseVM(element) && !element.isComplete));
 
 		if (element.isComplete || element.isCanceled) {
@@ -2232,7 +2235,10 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		const isPlanningMiddlewareCarousel = isPlanningMiddlewareQuestionCarousel(carousel.resolveId);
 		const inputPartHasCarousel = widget?.input.questionCarousel !== undefined;
 
-		if (isPlanningMiddlewareCarousel && responseIsComplete && !carousel.isUsed) {
+		if (isPlanningMiddlewareCarousel && !carousel.isUsed) {
+			if (carousel.resolveId) {
+				widget?.input.clearQuestionCarousel(undefined, carousel.resolveId);
+			}
 			const inlinePart = this.instantiationService.createInstance(ChatQuestionCarouselPart, carousel, context, {
 				shouldAutoFocus: shouldAutoFocus,
 				onSubmit: async (answers) => handleSubmit(answers, inlinePart)
@@ -2394,6 +2400,11 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 	}
 
 	private renderMarkdown(markdown: IChatMarkdownContent, templateData: IChatListItemTemplate, context: IChatContentPartRenderContext): IChatContentPart {
+		const visibleMarkdown = this.getVisibleMarkdownForPlanningResponse(markdown, context);
+		if (!visibleMarkdown) {
+			return this.renderNoContent(other => other.kind === markdown.kind && other.content.value === markdown.content.value);
+		}
+		markdown = visibleMarkdown;
 		const element = context.element;
 		const isBlankMarkdown = !markdown.content.value.trim();
 		// Don't finalize thinking if the markdown has an incomplete codeblock with a
@@ -2560,6 +2571,35 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 			}
 
 		}
+	}
+
+	private getVisibleMarkdownForPlanningResponse(markdown: IChatMarkdownContent, context: IChatContentPartRenderContext): IChatMarkdownContent | undefined {
+		if (!this.isPlanningPlanResponse(context)) {
+			return markdown;
+		}
+
+		const planStartOffset = findPlanningPlanStartOffset(markdown.content.value);
+		if (planStartOffset === undefined) {
+			return markdown;
+		}
+
+		const visiblePrefix = markdown.content.value.slice(0, planStartOffset).trim();
+		if (!visiblePrefix) {
+			return undefined;
+		}
+
+		return {
+			...markdown,
+			content: MarkdownString.lift({
+				...markdown.content,
+				value: visiblePrefix,
+			}),
+		};
+	}
+
+	private isPlanningPlanResponse(context: IChatContentPartRenderContext): boolean {
+		return isResponseVM(context.element)
+			&& context.content.some(part => part.kind === 'progressMessage' && part.id === planningPlanProgressMessageId);
 	}
 
 	disposeElement(node: ITreeNode<ChatTreeItem, FuzzyScore>, index: number, templateData: IChatListItemTemplate, details?: IListElementRenderDetails): void {

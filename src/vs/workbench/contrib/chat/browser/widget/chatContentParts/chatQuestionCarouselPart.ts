@@ -659,6 +659,9 @@ export class ChatQuestionCarouselPart extends Disposable implements IChatContent
 			const titleText = isMarkdownString(questionText) ? MarkdownString.lift(questionText) : new MarkdownString(questionText);
 			const renderedTitle = questionRenderStore.add(this._markdownRendererService.render(titleText));
 			title.appendChild(renderedTitle.element);
+			if (question.required) {
+				title.appendChild(dom.$('span.chat-question-required', { 'aria-hidden': 'true' }, '*'));
+			}
 			titleRow.appendChild(title);
 		}
 

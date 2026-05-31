@@ -56,7 +56,32 @@ export interface IGeneratedPlanningQuestionsResult {
 	readonly modelId: string;
 }
 
+export interface IPlanningPlanStepControlTarget {
+	readonly index: number;
+	readonly label: string;
+	readonly text: string;
+	readonly sectionTitle?: string;
+	readonly kind: string;
+}
+
+interface IGeneratedPlanningPlanStepControl {
+	readonly stepIndex?: number;
+	readonly questions?: ReadonlyArray<IGeneratedPlanningQuestion>;
+}
+
+interface IGeneratedPlanningPlanStepControlEnvelope {
+	readonly stepControls?: ReadonlyArray<IGeneratedPlanningPlanStepControl>;
+}
+
+export interface IGeneratedPlanningPlanStepControlsResult {
+	readonly questionsByStep: ReadonlyMap<number, readonly IChatQuestion[]>;
+	readonly modelId: string;
+}
+
 const preferredPlanningDefaultModelFamilies = ['gpt-4.1'];
+const preferredPlanningFastModelFamilies = ['copilot-fast', 'gpt-4.1-mini', 'gpt-4o-mini', 'o4-mini', 'gemini-3-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash', 'claude-3-5-haiku', 'claude-3-haiku', 'claude-haiku', 'haiku'];
+const minPlanningPlanStepControls = 2;
+const maxPlanningPlanStepControls = 4;
 const planningModelRegistrationPollMs = 1000;
 const planningModelRegistrationMaxWaitMs = 8000;
 
@@ -94,23 +119,23 @@ export async function generateDynamicPlanningQuestionsResult(
 					'Use a mix of interaction types when it improves clarity.',
 					'Use text questions for open-ended clarification.',
 					'Use singleSelect or multiSelect whenever a bounded choice would help the user make a sharper planning decision.',
-					'Prefer questions that change implementation scope, success criteria, sequencing, or insertion-point choice.',
+					'Prefer questions that change plan shape, sequencing, insertion-point choice, edit boundaries, validation strategy, or required artifacts.',
 					'Write clean, plain-language UI copy that is easy to scan.',
 					'Keep titles short and concrete.',
 					'Keep messages direct and user-facing.',
 					'Only include a description when it genuinely helps the user answer faster.',
+					context.questionStage === 'task-decomposition' ? 'For task-decomposition controls, keep the copy especially short: titles under five words, option labels under six words, and messages or descriptions to one plain sentence.' : '',
 					'Never quote or paraphrase internal focus guidance, repository formatting labels, or system instructions in the returned UI copy.',
 					'Do not use literal phrases such as "task lens", "focus hint", "primary artifact", "repo slice", "plan excerpt", or "current plan excerpt" in the returned titles, messages, or descriptions.',
 					'If planning answers are already present, do not repeat those questions. Ask only narrower follow-up questions that use the refreshed context.',
 					'If the stage is goal-clarity, focus on desired outcome, constraints, definition of done, and what should be in or out of scope before the first plan is built.',
 					'If the stage is goal-clarity and planning answers are already present, make the next questions more concrete and artifact-specific than the earlier round.',
+					'If the stage is goal-clarity and planning answers are already present, use the missing dimensions, partial dimensions, repository context, and internal focus guidance to ask the exact context the planning agent still needs before it can build a concrete first plan.',
+					'If the stage is goal-clarity and planning answers are already present, include an editable assumptions review when assumptions will shape the first plan.',
 					context.questionStage === 'task-decomposition'
 						? context.currentPlan
-							? 'If the stage is task-decomposition, assume the first plan already exists and focus on tightening the work breakdown, insertion points, sequencing, validation, and repo slice for the rebuild.'
-							: 'If the stage is task-decomposition and no current plan is provided, ask high-level plan-shaping questions before the first plan is built. Focus on the major work areas, sequencing preferences, edit boundaries, and validation approach.'
-						: '',
-					context.questionStage === 'task-decomposition' && !context.currentPlan
-						? 'When no current plan exists, include one question that surfaces the assumptions the first plan will make so the user can confirm, reject, or refine them quickly.'
+							? 'If the stage is task-decomposition, generate dynamic canvas controls from all available context: current plan, repo context, goal-clarity answers, planner notes, and recent chat. Assume the first plan already exists and focus on actionable changes to the work breakdown, insertion points, sequencing, validation, and repo slice for the rebuild.'
+							: 'If the stage is task-decomposition and no current plan is provided, generate dynamic plan-shaping controls from all available context: repo context, goal-clarity answers, planner notes, and recent chat. Focus on the major work areas, sequencing preferences, edit boundaries, and validation approach.'
 						: '',
 					context.currentPlan
 						? 'If the current plan already names files, directories, symbols, dependencies, or validation targets, make your task-decomposition questions explicitly reference those concrete plan slices.'
@@ -138,7 +163,7 @@ export async function generateDynamicPlanningQuestionsResult(
 					'If the request intent is data analysis and the stage is goal-clarity, ask what the user wants to learn, decide, or communicate with the analysis. Audience and helpful data context are strong follow-up topics when question budget allows.',
 					'If the request intent is script work, lead with the script, entrypoint, or runtime context that matters most.',
 					requestedQuestionCount > 1 ? 'For goal-clarity, prefer at least one structured choice question plus one open text question unless the context is genuinely too ambiguous.' : '',
-					context.questionStage === 'task-decomposition' ? 'For task-decomposition, prefer a structured work-breakdown or insertion-point question and avoid drifting back into abstract scope questions.' : '',
+					context.questionStage === 'task-decomposition' ? 'For task-decomposition, every control must be context-specific and actionable. Do not return a generic static checklist such as keep, revise, split, or defer unless those actions are tied to concrete plan steps, files, validation targets, or dependencies from the current context.' : '',
 					context.questionStage === 'plan-focus' ? 'For plan-focus, return a complementary set of follow-up controls that zoom in on the named focus area using the current plan and narrowed repo context. At least one question should lock the concrete repo slice, file, or subsystem, and at least one should sharpen risk, validation, sequencing, or dependency handling.' : '',
 					'Descriptions should be concise and help the user understand why the question matters.',
 					'Do not repeat the same question theme across both stages.',
@@ -157,7 +182,7 @@ export async function generateDynamicPlanningQuestionsResult(
 	let lastError: Error | undefined;
 	let providerRetryAttempted = false;
 	while (true) {
-		const candidateModelIds = await getCandidateModelIds(languageModelsService, context.modelId);
+		const candidateModelIds = await getCandidateModelIds(languageModelsService, context.modelId, context.questionStage);
 		if (candidateModelIds.length === 0) {
 			if (!providerRetryAttempted && shouldWaitForLanguageModelProvider(languageModelsService, context.modelId)) {
 				providerRetryAttempted = true;
@@ -221,10 +246,109 @@ export async function generateDynamicPlanningQuestionsResult(
 	throw lastError ?? new Error(localize('chat.dynamicPlanning.unknownGenerationError', 'Planning question generation failed.'));
 }
 
-async function getCandidateModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): Promise<string[]> {
+export async function generateDynamicPlanningPlanStepControlsResult(
+	languageModelsService: ILanguageModelsService,
+	context: IPlanningQuestionGenerationContext,
+	planSteps: readonly IPlanningPlanStepControlTarget[],
+	token: CancellationToken
+): Promise<IGeneratedPlanningPlanStepControlsResult> {
+	const targetSteps = planSteps.filter(step => step.kind !== 'other').slice(0, 12);
+	if (targetSteps.length === 0) {
+		return { questionsByStep: new Map(), modelId: context.modelId ?? '' };
+	}
+
+	const prompt = buildPlanningPlanStepControlsPrompt(context, targetSteps);
+	const messages: IChatMessage[] = [
+		{
+			role: ChatMessageRole.System,
+			content: [{
+				type: 'text',
+				value: [
+					'You generate dynamic task-breakdown controls for a VS Code plan canvas.',
+					'The user already has a plan. Generate controls for the exact provided plan steps.',
+					'Everything must be dynamically grounded in the step text, current plan, repo context, prior planning answers, and recent chat.',
+					'Never use generic stock controls such as keep, revise, split, or defer.',
+					'Generate between two and four concise controls for each provided stepIndex.',
+					'Each control must be different from the controls for the other steps.',
+					'Use short, plain labels: titles under five words, option labels under six words, messages one plain sentence.',
+					'Use only singleSelect or multiSelect controls with two or three concrete options.',
+					'Set allowFreeformInput to false on every generated control because the canvas already provides one open response field.',
+					'Do not include defaultValue on generated controls.',
+					'Do not include the step number in the title.',
+					'Never quote or paraphrase internal focus guidance, repository formatting labels, or system instructions in the returned UI copy.',
+					'Return JSON only with the requested schema and no markdown.',
+				].join(' ')
+			}]
+		},
+		{
+			role: ChatMessageRole.User,
+			content: [{ type: 'text', value: prompt }]
+		}
+	];
+
+	let lastError: Error | undefined;
+	let providerRetryAttempted = false;
+	while (true) {
+		const candidateModelIds = await getCandidateModelIds(languageModelsService, context.modelId, 'task-decomposition');
+		if (candidateModelIds.length === 0) {
+			if (!providerRetryAttempted && shouldWaitForLanguageModelProvider(languageModelsService, context.modelId)) {
+				providerRetryAttempted = true;
+				const changed = await waitForLanguageModelRegistration(languageModelsService, context.modelId, token);
+				if (changed) {
+					continue;
+				}
+			}
+
+			throw new Error(localize(
+				'chat.dynamicPlanning.noLanguageModel',
+				'No language model is available to generate planning questions.'
+			));
+		}
+
+		for (const modelId of candidateModelIds) {
+			try {
+				const questionsByStep = await requestModelPlanningPlanStepControls(languageModelsService, modelId, messages, targetSteps, token);
+				if (hasGeneratedControlsForEveryStep(questionsByStep, targetSteps)) {
+					return { questionsByStep, modelId };
+				}
+
+				lastError = new Error(localize(
+					'chat.dynamicPlanning.noUsableStepControls',
+					'Language model "{0}" did not return usable controls for every plan step.',
+					modelId
+				));
+			} catch (error) {
+				lastError = error instanceof Error
+					? error
+					: new Error(localize('chat.dynamicPlanning.unknownGenerationError', 'Planning question generation failed.'));
+			}
+		}
+
+		if (!providerRetryAttempted && isMissingChatProviderError(lastError)) {
+			providerRetryAttempted = true;
+			const changed = await waitForLanguageModelRegistration(languageModelsService, context.modelId, token);
+			if (changed) {
+				continue;
+			}
+		}
+
+		break;
+	}
+
+	if (isMissingChatProviderError(lastError)) {
+		throw new Error(localize(
+			'chat.dynamicPlanning.modelProviderUnavailable',
+			'No active language model is ready to generate planning questions yet. Try again in a moment.'
+		));
+	}
+
+	throw lastError ?? new Error(localize('chat.dynamicPlanning.unknownGenerationError', 'Planning question generation failed.'));
+}
+
+async function getCandidateModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined, questionStage: PlanningQuestionStage): Promise<string[]> {
 	const candidateModelIds: string[] = [];
 	const seen = new Set<string>();
-	const providerBackedModelIds = await getProviderBackedModelIds(languageModelsService, preferredModelId);
+	const providerBackedModelIds = await getProviderBackedModelIds(languageModelsService, preferredModelId, questionStage);
 	const availableModelIds = providerBackedModelIds.length > 0 ? providerBackedModelIds : languageModelsService.getLanguageModelIds();
 	const pushCandidate = (modelId: string | undefined) => {
 		if (!modelId || seen.has(modelId)) {
@@ -243,7 +367,7 @@ async function getCandidateModelIds(languageModelsService: ILanguageModelsServic
 		candidateModelIds.push(modelId);
 	};
 
-	if (!providerBackedModelIds.length || providerBackedModelIds.includes(preferredModelId ?? '')) {
+	if (!providerBackedModelIds.length || (questionStage !== 'task-decomposition' && providerBackedModelIds.includes(preferredModelId ?? ''))) {
 		pushCandidate(preferredModelId);
 	}
 
@@ -261,11 +385,17 @@ async function getCandidateModelIds(languageModelsService: ILanguageModelsServic
 	return candidateModelIds;
 }
 
-async function getProviderBackedModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined): Promise<string[]> {
+async function getProviderBackedModelIds(languageModelsService: ILanguageModelsService, preferredModelId: string | undefined, questionStage: PlanningQuestionStage): Promise<string[]> {
 	const result = new Set<string>();
 	const preferredMetadata = preferredModelId ? languageModelsService.lookupLanguageModel(preferredModelId) : undefined;
 	const preferredVendor = preferredMetadata?.vendor;
 	const shouldPreferPlanningDefault = !preferredModelId || !isExecutablePlanningModelId(preferredModelId) || !preferredMetadata;
+
+	if (questionStage === 'task-decomposition') {
+		for (const modelId of await getPreferredPlanningFastModelIds(languageModelsService)) {
+			result.add(modelId);
+		}
+	}
 
 	if (shouldPreferPlanningDefault) {
 		for (const modelId of await getPreferredPlanningDefaultModelIds(languageModelsService)) {
@@ -304,6 +434,14 @@ async function getProviderBackedModelIds(languageModelsService: ILanguageModelsS
 }
 
 async function getPreferredPlanningDefaultModelIds(languageModelsService: ILanguageModelsService): Promise<string[]> {
+	return getPreferredPlanningModelIds(languageModelsService, preferredPlanningDefaultModelFamilies);
+}
+
+async function getPreferredPlanningFastModelIds(languageModelsService: ILanguageModelsService): Promise<string[]> {
+	return getPreferredPlanningModelIds(languageModelsService, preferredPlanningFastModelFamilies);
+}
+
+async function getPreferredPlanningModelIds(languageModelsService: ILanguageModelsService, preferredFamilies: readonly string[]): Promise<string[]> {
 	const result = new Set<string>();
 	const pushModelId = (modelId: string) => {
 		if (isExecutablePlanningModelId(modelId)) {
@@ -311,7 +449,7 @@ async function getPreferredPlanningDefaultModelIds(languageModelsService: ILangu
 		}
 	};
 
-	for (const family of preferredPlanningDefaultModelFamilies) {
+	for (const family of preferredFamilies) {
 		for (const modelId of await languageModelsService.selectLanguageModels({ id: family })) {
 			pushModelId(modelId);
 		}
@@ -321,7 +459,7 @@ async function getPreferredPlanningDefaultModelIds(languageModelsService: ILangu
 	}
 
 	for (const modelId of languageModelsService.getLanguageModelIds()) {
-		if (isPreferredPlanningDefaultModel(languageModelsService.lookupLanguageModel(modelId))) {
+		if (isPreferredPlanningModel(languageModelsService.lookupLanguageModel(modelId), preferredFamilies)) {
 			pushModelId(modelId);
 		}
 	}
@@ -329,14 +467,14 @@ async function getPreferredPlanningDefaultModelIds(languageModelsService: ILangu
 	return [...result];
 }
 
-function isPreferredPlanningDefaultModel(metadata: ReturnType<ILanguageModelsService['lookupLanguageModel']>): boolean {
+function isPreferredPlanningModel(metadata: ReturnType<ILanguageModelsService['lookupLanguageModel']>, preferredFamilies: readonly string[]): boolean {
 	if (!metadata) {
 		return false;
 	}
 
 	const normalizedId = metadata.id?.toLowerCase();
 	const normalizedFamily = metadata.family?.toLowerCase();
-	return preferredPlanningDefaultModelFamilies.some(family =>
+	return preferredFamilies.some(family =>
 		normalizedId === family
 		|| normalizedId?.startsWith(`${family}-`) === true
 		|| normalizedFamily === family
@@ -434,6 +572,19 @@ async function requestModelPlanningQuestions(
 	return normalizeGeneratedQuestions(parsed, context);
 }
 
+async function requestModelPlanningPlanStepControls(
+	languageModelsService: ILanguageModelsService,
+	modelId: string,
+	messages: IChatMessage[],
+	planSteps: readonly IPlanningPlanStepControlTarget[],
+	token: CancellationToken,
+): Promise<ReadonlyMap<number, readonly IChatQuestion[]>> {
+	const response = await languageModelsService.sendChatRequest(modelId, undefined, messages, {}, token);
+	const responseText = await getTextResponseFromStream(response);
+	const parsed = parsePlanningPlanStepControlEnvelope(responseText);
+	return normalizeGeneratedPlanningPlanStepControls(parsed, planSteps);
+}
+
 function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext, requestedQuestionCount: number): string {
 	const sections = [
 		`Planning phase:\n${context.planningPhase} (${getPlanningPhaseLabel(context.planningPhase)})`,
@@ -504,16 +655,19 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 			? `Return exactly ${requestedQuestionCount} questions that clarify the implementation goal, constraints, non-goals, and what success looks like before the first plan is built.`
 			: context.questionStage === 'task-decomposition'
 				? context.currentPlan
-					? `Return exactly ${requestedQuestionCount} questions that tighten the first plan into a stronger work breakdown, insertion-point choice, repo slice, and validation path. At least two questions should hook into concrete files, steps, dependencies, or validation targets already named in the current plan or task lens.`
-					: `Return exactly ${requestedQuestionCount} questions that help the user co-create the high-level plan before the first detailed plan is built. Cover the major work areas, ordering, scope boundaries, and validation approach without getting into low-level implementation minutiae.`
+					? `Return exactly ${requestedQuestionCount} dynamic task-breakdown controls that tighten the first plan into a stronger work breakdown, insertion-point choice, repo slice, and validation path. Derive them from the current plan, repo context, goal-clarity answers, planner notes, and recent chat. At least two controls should hook into concrete files, steps, dependencies, or validation targets already named in the current plan or task lens.`
+					: `Return exactly ${requestedQuestionCount} dynamic task-breakdown controls that help the user co-create the high-level plan before the first detailed plan is built. Derive them from the repo context, goal-clarity answers, planner notes, and recent chat. Cover the major work areas, ordering, affected artifacts, edit boundaries, and validation approach without getting into low-level implementation minutiae.`
 				: `Return exactly ${requestedQuestionCount} questions that zoom in on one specific aspect of the rebuilt plan using the named focus area, the latest plan text, and the narrowed repo context.`,
 		context.questionStage === 'goal-clarity'
 			? 'Prefer a light but engaging pre-planning UX: the questions should feel closer to ask-questions than a heavy middleware banner.'
 			: context.questionStage === 'task-decomposition'
 				? context.currentPlan
-					? 'Prefer a concrete refinement UX: one question should usually lock in work breakdown, insertion point, file or repo slice, or validation.'
-					: 'Prefer a collaborative plan-shaping UX: use checkable choices where possible so the user can quickly confirm, reject, or add work areas before seeing a full plan.'
+					? 'Prefer a concrete refinement UX: controls should offer specific plan edits the user can apply, such as reordering named steps, narrowing a named file slice, changing a validation target, or splitting a concrete dependency-heavy step. Keep every label plain, short, and clear.'
+					: 'Prefer a collaborative plan-shaping UX: use checkable choices where possible so the user can quickly confirm, reject, or add work areas before seeing a full plan. Keep every label plain, short, and clear.'
 				: 'Prefer a focused refinement UX: the questions should feel like a zoom-in on one part of the plan, not a restart of the whole plan. When possible, cover the exact repo slice, the key unresolved decision, and the evidence or validation needed for that focused change.',
+		context.questionStage === 'goal-clarity' && context.planningAnswers.length > 0
+			? 'This is a follow-up goal-clarity round. Ask only plan-critical context questions that are still needed before the first plan can be drafted; be thorough, concrete, and avoid repeating prior answers.'
+			: '',
 		'Avoid generic project-management questions.',
 		'Do not ask for information that is already clear from the repo context, current plan, or earlier answers.',
 		'Use the richer repository context to narrow the work as the phase becomes more specific.',
@@ -527,9 +681,8 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 			: context.questionStage === 'task-decomposition'
 				? context.currentPlan
 					? 'Do not repeat goal-clarity questions that are already answered in the planning context.'
-					: 'Do not ask the user to approve a plan that does not exist yet. Ask which high-level work areas and ordering choices should shape the first plan.'
+					: 'Do not ask the user to approve a plan that does not exist yet. Ask which high-level work areas and ordering choices should shape the first plan. Do not ask goal, scope, definition-of-done, or assumption-review questions here.'
 				: 'Do not drift back into broad decomposition or restart the plan from scratch.',
-		context.questionStage === 'task-decomposition' && !context.currentPlan ? 'Include one assumption-confirmation question so the user can quickly confirm, reject, or refine what the first plan will assume.' : '',
 		context.shouldConfirmPlanningTarget ? 'Do not ask the user to confirm the primary repo target again; that is being collected separately.' : '',
 		'For singleSelect and multiSelect questions, defaultValue must reference the option label.'
 	].join(' '));
@@ -537,6 +690,66 @@ function buildPlanningQuestionPrompt(context: IPlanningQuestionGenerationContext
 	sections.push([
 		'JSON schema:',
 		'{"questions":[{"title":"...","message":"...","type":"text|singleSelect|multiSelect","required":true|false,"allowFreeformInput":true|false,"options":[{"label":"...","value":"..."}],"defaultValue":"..."|["..."]}]}'
+	].join('\n'));
+
+	return sections.join('\n\n');
+}
+
+function buildPlanningPlanStepControlsPrompt(context: IPlanningQuestionGenerationContext, planSteps: readonly IPlanningPlanStepControlTarget[]): string {
+	const sections = [
+		`Planning phase:\n${context.planningPhase} (${getPlanningPhaseLabel(context.planningPhase)})`,
+		'Question stage:\ntask-decomposition',
+		`User request:\n${context.userRequest.trim()}`,
+	];
+
+	if (context.currentPlan) {
+		sections.push(`Current plan:\n${truncate(context.currentPlan, 2200)}`);
+	}
+
+	if (context.plannerNotes) {
+		sections.push(`Planner notes:\n${context.plannerNotes}`);
+	}
+
+	if (context.planningAnswers.length > 0) {
+		sections.push(`Existing planning answers:\n${context.planningAnswers.map(answer => `- ${answer.question}: ${answer.answer}`).join('\n')}`);
+	}
+
+	if (context.recentConversation.length > 0) {
+		sections.push(`Recent planning conversation:\n${context.recentConversation.map(entry => `- ${entry}`).join('\n')}`);
+	}
+
+	if (context.repositoryContext) {
+		sections.push(formatRepositoryContext(context.repositoryContext));
+	}
+
+	if (context.focusHint) {
+		sections.push(`Internal focus guidance (do not quote verbatim):\n${context.focusHint}`);
+	}
+
+	sections.push([
+		'Plan steps that need controls:',
+		...planSteps.map(step => [
+			`stepIndex: ${step.index}`,
+			`kind: ${step.kind}`,
+			step.sectionTitle ? `section: ${step.sectionTitle}` : undefined,
+			`label: ${step.label}`,
+			`text: ${truncate(step.text, 650)}`,
+		].filter((value): value is string => !!value).join('\n'))
+	].join('\n\n'));
+
+	sections.push([
+		'Return at least two and at most four controls for every listed stepIndex.',
+		'Make each control target the concrete work in that step.',
+		'For implementation steps, ask about insertion point, sequencing, blast radius, or edit boundary when relevant.',
+		'For verification steps, ask about the strongest validation signal.',
+		'For decision or guardrail steps, ask about the exact choice or constraint that should shape the revised plan.',
+		'Do not ask goal-clarity questions. Do not ask what the overall goal is.',
+		'Do not use generic controls shared by every step.',
+		'Use only singleSelect or multiSelect controls. Do not return text controls.',
+		'Set allowFreeformInput to false for every generated control.',
+		'Do not set defaultValue.',
+		'JSON schema:',
+		'{"stepControls":[{"stepIndex":1,"questions":[{"title":"...","message":"...","type":"singleSelect|multiSelect","required":false,"allowFreeformInput":false,"options":[{"label":"...","value":"..."}]}]}]}'
 	].join('\n'));
 
 	return sections.join('\n\n');
@@ -581,6 +794,23 @@ function parseQuestionEnvelope(raw: string): IGeneratedPlanningQuestionEnvelope 
 	}
 }
 
+function parsePlanningPlanStepControlEnvelope(raw: string): IGeneratedPlanningPlanStepControlEnvelope | undefined {
+	const trimmed = raw.trim();
+	if (!trimmed) {
+		return undefined;
+	}
+
+	const withoutFences = trimmed.startsWith('```')
+		? trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+		: trimmed;
+
+	try {
+		return JSON.parse(withoutFences) as IGeneratedPlanningPlanStepControlEnvelope;
+	} catch {
+		return undefined;
+	}
+}
+
 function normalizeGeneratedQuestions(parsed: IGeneratedPlanningQuestionEnvelope | undefined, context: IPlanningQuestionGenerationContext): IChatQuestion[] {
 	const questions = parsed?.questions;
 	if (!questions?.length) {
@@ -590,6 +820,55 @@ function normalizeGeneratedQuestions(parsed: IGeneratedPlanningQuestionEnvelope 
 	return finalizeGeneratedQuestions(questions
 		.map(normalizeGeneratedQuestion)
 		.filter((question): question is IChatQuestion => !!question), context);
+}
+
+function normalizeGeneratedPlanningPlanStepControls(
+	parsed: IGeneratedPlanningPlanStepControlEnvelope | undefined,
+	planSteps: readonly IPlanningPlanStepControlTarget[],
+): ReadonlyMap<number, readonly IChatQuestion[]> {
+	const controls = parsed?.stepControls;
+	if (!controls?.length) {
+		return new Map();
+	}
+
+	const validStepIndexes = new Set(planSteps.map(step => step.index));
+	const questionsByStep = new Map<number, IChatQuestion[]>();
+	let fallbackStepOffset = 0;
+
+	for (const control of controls) {
+		const fallbackStepIndex = planSteps[fallbackStepOffset++]?.index;
+		const stepIndex = typeof control.stepIndex === 'number' && validStepIndexes.has(control.stepIndex)
+			? control.stepIndex
+			: fallbackStepIndex;
+		if (typeof stepIndex !== 'number') {
+			continue;
+		}
+
+		const questions = (control.questions ?? [])
+			.map(normalizeGeneratedQuestion)
+			.filter((question): question is IChatQuestion => !!question)
+			.filter(question => question.type !== 'text')
+			.map(question => ({
+				...question,
+				allowFreeformInput: false,
+				defaultValue: undefined,
+			}));
+		if (!questions.length) {
+			continue;
+		}
+
+		const existing = questionsByStep.get(stepIndex) ?? [];
+		questionsByStep.set(stepIndex, dedupeQuestionsByPrompt([...existing, ...questions]).slice(0, maxPlanningPlanStepControls));
+	}
+
+	return questionsByStep;
+}
+
+function hasGeneratedControlsForEveryStep(questionsByStep: ReadonlyMap<number, readonly IChatQuestion[]>, planSteps: readonly IPlanningPlanStepControlTarget[]): boolean {
+	return planSteps.every(step => {
+		const count = questionsByStep.get(step.index)?.length ?? 0;
+		return count >= minPlanningPlanStepControls && count <= maxPlanningPlanStepControls;
+	});
 }
 
 function normalizeGeneratedQuestion(question: IGeneratedPlanningQuestion): IChatQuestion | undefined {
@@ -705,7 +984,7 @@ function isInitialTaskDecompositionContext(context: IPlanningQuestionGenerationC
 }
 
 function addSupplementalPlanningQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
-	return addInitialPlanShapingQuestions(addDataAnalysisGoalQuestions(questions, context), context);
+	return addGoalClarityAssumptionQuestion(addDataAnalysisGoalQuestions(questions, context), context);
 }
 
 function addDataAnalysisGoalQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
@@ -715,6 +994,10 @@ function addDataAnalysisGoalQuestions(questions: readonly IChatQuestion[], conte
 
 	const enriched = [...questions];
 	for (const candidate of createDataAnalysisGoalQuestions(context)) {
+		if (hasPriorPlanningAnswerForQuestion(candidate, context.planningAnswers)) {
+			continue;
+		}
+
 		if (enriched.some(existing => isSimilarDataAnalysisQuestion(existing, candidate))) {
 			continue;
 		}
@@ -725,12 +1008,12 @@ function addDataAnalysisGoalQuestions(questions: readonly IChatQuestion[], conte
 	return enriched;
 }
 
-function addInitialPlanShapingQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
-	if (!isInitialTaskDecompositionContext(context)) {
+function addGoalClarityAssumptionQuestion(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
+	if (!shouldSurfaceGoalClarityAssumptions(context)) {
 		return [...questions];
 	}
 
-	const assumptionQuestion = createInitialPlanAssumptionQuestion(context);
+	const assumptionQuestion = createPlanAssumptionQuestion(context);
 	if (questions.some(question => isPlanAssumptionQuestion(question) || computeOverlap(normalizeQuestionPrompt(question), normalizeQuestionPrompt(assumptionQuestion)) >= 0.42)) {
 		return [...questions];
 	}
@@ -738,7 +1021,19 @@ function addInitialPlanShapingQuestions(questions: readonly IChatQuestion[], con
 	return [assumptionQuestion, ...questions];
 }
 
-function createInitialPlanAssumptionQuestion(context: IPlanningQuestionGenerationContext): IChatQuestion {
+function shouldSurfaceGoalClarityAssumptions(context: IPlanningQuestionGenerationContext): boolean {
+	if (context.questionStage !== 'goal-clarity' || context.planningAnswers.length === 0) {
+		return false;
+	}
+
+	if (!/\b(assumption|assumptions|editable assumptions|review.*assumptions|assumptions.*review)\b/i.test(context.focusHint ?? '')) {
+		return false;
+	}
+
+	return !context.planningAnswers.some(answer => /\b(assumption|assumptions|should shape the first plan|before.*plan)\b/i.test(`${answer.question} ${answer.answer}`));
+}
+
+function createPlanAssumptionQuestion(context: IPlanningQuestionGenerationContext): IChatQuestion {
 	const taskLens = context.repositoryContext?.taskLens;
 	const options: { id: string; label: string; value: string }[] = [];
 	const seen = new Set<string>();
@@ -775,17 +1070,28 @@ function createInitialPlanAssumptionQuestion(context: IPlanningQuestionGeneratio
 		pushOption(localize('chat.dynamicPlanning.planAssumptionValidation', 'Reserve validation for {0}', taskLens.validationTargets.slice(0, 2).join(', ')), `validation:${taskLens.validationTargets.slice(0, 2).join(', ')}`);
 	}
 
+	if (context.missingDimensions?.includes('scope-boundaries') || context.partialDimensions?.includes('scope-boundaries')) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionScopeBoundary', 'Keep scope limited to the stated target unless a dependency is explicit'), 'scope-boundary');
+	}
+
+	if (context.missingDimensions?.includes('constraints') || context.partialDimensions?.includes('constraints')) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionConstraints', 'Use conservative defaults for unspecified constraints'), 'conservative-defaults');
+	}
+
+	if (context.missingDimensions?.includes('validation') || context.partialDimensions?.includes('validation')) {
+		pushOption(localize('chat.dynamicPlanning.planAssumptionValidationFallback', 'Include a lightweight validation step'), 'lightweight-validation');
+	}
+
 	pushOption(localize('chat.dynamicPlanning.planAssumptionStatedGoal', 'Keep the plan focused on the stated goal'), 'stated-goal');
 	pushOption(localize('chat.dynamicPlanning.planAssumptionWorkspaceBoundary', 'Use the current workspace context as the boundary'), 'workspace-boundary');
-	pushOption(localize('chat.dynamicPlanning.planAssumptionValidationFallback', 'Include a lightweight validation step'), 'lightweight-validation');
 
 	const trimmedOptions = options.slice(0, 5);
 	return {
 		id: 'dynamic-planning-plan-assumptions',
 		type: 'multiSelect',
-		title: localize('chat.dynamicPlanning.planAssumptionTitle', 'Plan Assumptions'),
-		message: localize('chat.dynamicPlanning.planAssumptionMessage', 'Which assumptions should shape the first plan?'),
-		description: localize('chat.dynamicPlanning.planAssumptionDescription', 'Confirm the assumptions that fit, or add corrections.'),
+		title: localize('chat.dynamicPlanning.planAssumptionTitle', 'Working Assumptions'),
+		message: localize('chat.dynamicPlanning.planAssumptionMessage', 'Review assumptions before I draft the first plan.'),
+		description: localize('chat.dynamicPlanning.planAssumptionDescription', 'Uncheck anything wrong, or add corrections. These replace goal-clarification questions in the plan.'),
 		required: false,
 		allowFreeformInput: true,
 		options: trimmedOptions,
@@ -871,12 +1177,39 @@ function isSimilarDataAnalysisQuestion(existing: IChatQuestion, candidate: IChat
 	}
 }
 
+function hasPriorPlanningAnswerForQuestion(candidate: IChatQuestion, planningAnswers: readonly IPlanningTransitionAnswer[]): boolean {
+	if (planningAnswers.length === 0) {
+		return false;
+	}
+
+	const candidatePrompt = normalizeQuestionPrompt(candidate);
+	return planningAnswers.some(answer => {
+		const previousPrompt = normalizeWhitespace(answer.question);
+		if (previousPrompt && computeOverlap(previousPrompt, candidatePrompt) >= 0.38) {
+			return true;
+		}
+
+		switch (candidate.id) {
+			case 'dynamic-planning-analysis-kind':
+				return /\b(analysis type|analysis kind|types? of analysis|kind of analysis)\b/i.test(answer.question);
+			case 'dynamic-planning-analysis-goal':
+				return /\b(analysis goal|learn|decide|communicate|takeaway|result summary)\b/i.test(answer.question);
+			case 'dynamic-planning-analysis-audience':
+				return /\b(audience|who is this analysis for|technical collaborators|stakeholders?)\b/i.test(`${answer.question} ${answer.answer}`);
+			case 'dynamic-planning-analysis-context':
+				return /\b(data context|caveat|known issue|filter|definition)\b/i.test(answer.question);
+			default:
+				return false;
+		}
+	});
+}
+
 function finalizeGeneratedQuestions(questions: readonly IChatQuestion[], context: IPlanningQuestionGenerationContext): IChatQuestion[] {
 	const requestedQuestionCount = clampRequestedQuestionCount(context.questionCount);
 	const deduped = dedupeQuestionsByPrompt(questions);
 	const stageCandidates = context.questionStage === 'goal-clarity'
 		? deduped
-		: deduped.filter(question => !isOverlappingGoalClarityQuestion(question, context.planningAnswers));
+		: deduped.filter(question => !isOverlappingGoalClarityQuestion(question, context.planningAnswers) && !isPlanAssumptionQuestion(question));
 	const stageFiltered = dedupeQuestionsByPrompt(addSupplementalPlanningQuestions(stageCandidates, context));
 	if (stageFiltered.length < requestedQuestionCount) {
 		return [];
@@ -992,6 +1325,7 @@ function selectDataAnalysisGoalQuestions(
 		pushQuestion(rankedQuestions.find(isArtifactTargetingQuestion));
 	}
 
+	pushQuestion(rankedQuestions.find(isPlanAssumptionQuestion));
 	pushQuestion(rankedQuestions.find(isAnalysisKindQuestion));
 	pushQuestion(rankedQuestions.find(isAnalysisGoalQuestion));
 	pushQuestion(rankedQuestions.find(isAnalysisAudienceQuestion));
@@ -1019,7 +1353,6 @@ function selectInitialPlanShapingQuestions(rankedQuestions: readonly IChatQuesti
 		selected.push(question);
 	};
 
-	pushQuestion(rankedQuestions.find(isPlanAssumptionQuestion));
 	pushQuestion(rankedQuestions.find(question => question.type !== 'text' && !isPlanAssumptionQuestion(question)));
 	pushQuestion(rankedQuestions.find(question => question.type === 'text'));
 	for (const question of rankedQuestions) {
@@ -1037,7 +1370,10 @@ function isPlanAssumptionQuestion(question: IChatQuestion): boolean {
 		return true;
 	}
 
-	return /\b(assumption|assumptions|confirm.*plan|shape.*first plan|first plan.*assume)\b/i.test(normalizeQuestionPrompt(question));
+	const prompt = normalizeQuestionPrompt(question);
+	return /\bassumptions?\b/i.test(prompt)
+		|| /\bconfirm\b.{0,50}\b(plan|first plan)\b/i.test(prompt)
+		|| /\b(first plan|plan)\b.{0,50}\bassum(?:e|es|ed|ing|ptions?)\b/i.test(prompt);
 }
 
 function isArtifactTargetingQuestion(question: IChatQuestion): boolean {

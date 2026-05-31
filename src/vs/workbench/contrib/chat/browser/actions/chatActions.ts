@@ -69,7 +69,7 @@ import { ChatEditorInput, showClearEditingSessionConfirmation } from '../widgetH
 import { convertBufferToScreenshotVariable } from '../attachments/chatScreenshotContext.js';
 import { getChatSessionType, LocalChatSessionUri } from '../../common/model/chatUri.js';
 import { localChatSessionType } from '../../common/chatSessionsService.js';
-import { extractPlanningPlanSteps, extractPlanningPlanText, IPlanningPlanStep, summarizePlanningPlanChanges } from '../planning/chatPlanningPlanText.js';
+import { extractPlanningPlanSteps, extractPlanningPlanText, isUsablePlanningPlanText, summarizePlanningPlanChanges } from '../planning/chatPlanningPlanText.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { ChatViewPane } from '../widgetHosts/viewPane/chatViewPane.js';
 import { IWebviewWorkbenchService } from '../../../webviewPanel/browser/webviewWorkbenchService.js';
@@ -96,7 +96,13 @@ export const INSERT_TROUBLESHOOT_COMMAND_ID = 'workbench.action.chat.insertTroub
 export const OPEN_PLANNING_PLAN_ACTION_ID = 'workbench.action.chat.openPlanningPlan';
 export const OPEN_PLANNING_PLAN_TO_SIDE_ACTION_ID = 'workbench.action.chat.openPlanningPlanToSide';
 export const OPEN_PLANNING_PLAN_DIFF_ACTION_ID = 'workbench.action.chat.openPlanningPlanDiff';
+export const UPDATE_PLANNING_PLAN_ACTION_ID = 'workbench.action.chat.updatePlanningPlan';
 const PLANNING_PLAN_WEBVIEW_VIEW_TYPE = 'workbench.chat.planningPlanEditor';
+const planningPlanRegenerateControlsAnswerKey = 'plan-editor-regenerate-controls';
+const planningPlanRegenerateControlsAnswerValue = 'regenerate-controls';
+
+type PlanningPlanWebviewInput = ReturnType<IWebviewWorkbenchService['openWebview']>;
+const planningPlanWebviews = new Map<string, { readonly input: PlanningPlanWebviewInput; listener: { dispose(): void } }>();
 
 interface IPlanningPlanCommandArgs {
 	readonly sessionResource: URI | string;
@@ -106,6 +112,15 @@ interface IPlanningPlanCommandArgs {
 	readonly previousPlanText?: string;
 	readonly planSteps?: readonly IChatPlanningPlanEditorStep[];
 	readonly planEditorResolveId?: string;
+}
+
+interface IPlanningPlanUpdateCommandArgs {
+	readonly sessionResource: URI | string;
+	readonly requestId?: string;
+	readonly planText?: string;
+	readonly previousPlanText?: string;
+	readonly planSteps?: readonly IChatPlanningPlanEditorStep[];
+	readonly isComplete?: boolean;
 }
 
 const defaultChat = {
@@ -1620,7 +1635,8 @@ export function registerChatActions() {
 
 	function getPlanningPlanText(chatService: IChatService, sessionResource: URI, requestId: string): string | undefined {
 		const request = chatService.getSession(sessionResource)?.getRequests().find(candidate => candidate.id === requestId);
-		return extractPlanningPlanText(request?.response?.response);
+		return extractPlanningPlanText(request?.response?.entireResponse)
+			?? extractPlanningPlanText(request?.response?.response);
 	}
 
 	interface IPlanningPlanWebviewQuestion {
@@ -1646,7 +1662,7 @@ export function registerChatActions() {
 	}
 
 	function getPlanningPlanEditorSteps(currentPlanText: string, planSteps?: readonly IChatPlanningPlanEditorStep[]): readonly IChatPlanningPlanEditorStep[] {
-		const extractedSteps = extractPlanningPlanSteps(currentPlanText);
+		const extractedSteps = extractPlanningPlanSteps(currentPlanText, 24);
 		return planSteps?.length
 			? planSteps
 			: extractedSteps.length > 0
@@ -1683,7 +1699,7 @@ export function registerChatActions() {
 	}
 
 	function toPlanningPlanWebviewStep(step: IChatPlanningPlanEditorStep): IPlanningPlanWebviewStep {
-		const questions = step.questions?.length ? step.questions : [createFallbackPlanningPlanQuestion(step.kind)];
+		const questions = step.questions ?? [];
 		return {
 			id: step.id,
 			index: step.index,
@@ -1708,35 +1724,26 @@ export function registerChatActions() {
 		});
 	}
 
-	function isPlanningPlanWebviewSubmitMessage(message: unknown): message is { readonly type: 'apply' | 'continue'; readonly answers?: IChatQuestionAnswers } {
+	function getPlanningPlanWebviewStateKey(planText: string): string {
+		let hash = 0;
+		for (let i = 0; i < planText.length; i++) {
+			hash = ((hash << 5) - hash + planText.charCodeAt(i)) | 0;
+		}
+		return `${planText.length}:${hash.toString(36)}`;
+	}
+
+	function getPlanningPlanControlsStateKey(visiblePlanSteps: readonly IChatPlanningPlanEditorStep[]): string {
+		return visiblePlanSteps.map(step => [
+			step.index,
+			...(step.questions ?? []).map(question => `${question.id}:${question.title}:${question.type}:${question.options?.map(option => option.value).join(',') ?? ''}`)
+		].join('|')).join(';');
+	}
+
+	function isPlanningPlanWebviewSubmitMessage(message: unknown): message is { readonly type: 'apply' | 'continue' | 'regenerateControls'; readonly answers?: IChatQuestionAnswers } {
 		return typeof message === 'object'
 			&& message !== null
 			&& ('type' in message)
-			&& (message.type === 'apply' || message.type === 'continue');
-	}
-
-	function createFallbackPlanningPlanQuestion(kind: IPlanningPlanStep['kind']): IChatQuestion {
-		return {
-			id: `fallback-${kind}`,
-			type: 'text',
-			title: localize('openPlanningPlan.fallbackQuestionTitle', 'Refinement Question'),
-			message: getPlanningPlanStepQuestion(kind),
-			allowFreeformInput: true,
-			required: false,
-		};
-	}
-
-	function getPlanningPlanStepQuestion(kind: IPlanningPlanStep['kind']): string {
-		switch (kind) {
-			case 'verification':
-				return localize('openPlanningPlan.verificationQuestion', 'What evidence or check would make this verification step sufficient?');
-			case 'decision':
-				return localize('openPlanningPlan.decisionQuestion', 'What decision needs to be resolved before this step is useful?');
-			case 'guardrail':
-				return localize('openPlanningPlan.guardrailQuestion', 'What constraint or assumption should this guardrail capture?');
-			default:
-				return localize('openPlanningPlan.stepQuestion', 'What should change before this step is implemented?');
-		}
+			&& (message.type === 'apply' || message.type === 'continue' || message.type === 'regenerateControls');
 	}
 
 	function createPlanningPlanEditorInput(title: string, requestId: string, contents: string): IUntitledTextResourceEditorInput {
@@ -1752,32 +1759,44 @@ export function registerChatActions() {
 
 	function buildPlanningPlanWebviewHtml(currentPlanText: string, previousPlanText: string | undefined, planSteps: readonly IChatPlanningPlanEditorStep[], canSubmit: boolean): string {
 		const nonce = generateUuid();
-		const changeSummary = summarizePlanningPlanChanges(previousPlanText, currentPlanText);
+		const visiblePlanText = isUsablePlanningPlanText(currentPlanText) ? currentPlanText : '';
+		const visiblePreviousPlanText = previousPlanText && isUsablePlanningPlanText(previousPlanText) ? previousPlanText : undefined;
+		const visiblePlanSteps = visiblePlanText ? planSteps : [];
+		const changeSummary = summarizePlanningPlanChanges(visiblePreviousPlanText, visiblePlanText);
+		const controlsStateKey = getPlanningPlanControlsStateKey(visiblePlanSteps);
 		const data = {
-			currentPlanText,
+			currentPlanText: visiblePlanText,
+			previousPlanText: visiblePreviousPlanText,
+			stateKey: getPlanningPlanWebviewStateKey(visiblePlanText),
+			controlsStateKey,
 			changeSummary,
-			steps: planSteps.map(toPlanningPlanWebviewStep),
+			steps: visiblePlanSteps.map(step => toPlanningPlanWebviewStep(step)),
 			canSubmit,
+			regenerateControlsAnswerKey: planningPlanRegenerateControlsAnswerKey,
+			regenerateControlsAnswerValue: planningPlanRegenerateControlsAnswerValue,
 			labels: {
-				title: localize('openPlanningPlan.webviewTitle', 'Planning Plan'),
+				title: localize('openPlanningPlan.webviewTitle', 'Plan Canvas'),
 				changes: localize('openPlanningPlan.webviewChanges', 'Changes in This Revision'),
 				currentPlan: localize('openPlanningPlan.webviewCurrentPlan', 'Current Plan'),
-				editSection: localize('openPlanningPlan.webviewEditSection', 'Edit Selected Section'),
-				inlineQuestions: localize('openPlanningPlan.webviewInlineQuestions', 'Inline Plan Questions'),
-				question: localize('openPlanningPlan.webviewQuestion', 'Question'),
+				planCanvas: localize('openPlanningPlan.webviewPlanCanvas', 'Plan Canvas'),
+				inlineQuestions: localize('openPlanningPlan.webviewInlineQuestions', 'Plan Controls'),
+				stepControls: localize('openPlanningPlan.webviewStepControls', 'Step {0} Controls'),
+				chooseStep: localize('openPlanningPlan.webviewChooseStep', 'Select a step to shape it.'),
+				changeSomethingElse: localize('openPlanningPlan.webviewChangeSomethingElse', 'Change something else'),
+				changeSomethingElsePlaceholder: localize('openPlanningPlan.webviewChangeSomethingElsePlaceholder', 'Describe another change for this step.'),
+				changeThisPart: localize('openPlanningPlan.webviewOpenControls', 'Change'),
+				closeControls: localize('openPlanningPlan.webviewCloseControls', 'Close'),
+				question: localize('openPlanningPlan.webviewQuestion', 'Control'),
 				options: localize('openPlanningPlan.webviewOptions', 'Options'),
 				freeform: localize('openPlanningPlan.webviewFreeform', 'Additional answer or note'),
-				stepDecision: localize('openPlanningPlan.webviewStepDecision', 'Step Decision'),
-				keep: localize('openPlanningPlan.webviewKeep', 'Keep this step'),
-				revise: localize('openPlanningPlan.webviewRevise', 'Revise this step'),
-				defer: localize('openPlanningPlan.webviewDefer', 'Defer or remove this step'),
-				split: localize('openPlanningPlan.webviewSplit', 'Split this into smaller steps'),
-				stepNotes: localize('openPlanningPlan.webviewStepNotes', 'Step notes'),
-				additionalEdits: localize('openPlanningPlan.webviewAdditionalEdits', 'Other edits'),
+				noGeneratedControls: localize('openPlanningPlan.webviewNoGeneratedControls', 'Generating suggestions...'),
 				continue: localize('openPlanningPlan.webviewContinue', 'Continue'),
-				applyEdits: localize('openPlanningPlan.webviewApplyEdits', 'Apply Edits'),
-				submitted: localize('openPlanningPlan.webviewSubmitted', 'Plan edits submitted.'),
-				readOnly: localize('openPlanningPlan.webviewReadOnly', 'This opened plan is read-only because the chat review session is no longer active.'),
+				regenerateControls: localize('openPlanningPlan.webviewRegenerateControls', 'Refresh controls'),
+				applyEdits: localize('openPlanningPlan.webviewApplyEdits', 'Apply edits'),
+				submitted: localize('openPlanningPlan.webviewSubmitted', 'Submitted.'),
+				applyingEdits: localize('openPlanningPlan.webviewApplyingEdits', 'Updating plan...'),
+				regeneratingControls: localize('openPlanningPlan.webviewRegeneratingControls', 'Refreshing controls...'),
+				readOnly: localize('openPlanningPlan.webviewReadOnly', 'Controls are inactive.'),
 			}
 		};
 
@@ -1810,19 +1829,19 @@ export function registerChatActions() {
 
 					.plan-shell {
 						box-sizing: border-box;
-						max-width: 1180px;
-						margin: 0 auto;
-						padding: 20px 24px 28px;
+						width: 100%;
+						margin: 0;
+						padding: 14px 16px 24px;
 					}
 
 					.plan-header {
 						display: flex;
 						justify-content: space-between;
-						gap: 16px;
+						gap: 12px;
 						align-items: flex-start;
 						border-bottom: 1px solid var(--vscode-editorWidget-border);
-						padding-bottom: 12px;
-						margin-bottom: 18px;
+						padding-bottom: 10px;
+						margin-bottom: 14px;
 					}
 
 					h1, h2, h3 {
@@ -1833,16 +1852,16 @@ export function registerChatActions() {
 					}
 
 					h1 {
-						font-size: 22px;
+						font-size: 18px;
 					}
 
 					h2 {
-						font-size: 16px;
-						margin: 22px 0 10px;
+						font-size: 14px;
+						margin: 16px 0 8px;
 					}
 
 					h3 {
-						font-size: 14px;
+						font-size: 13px;
 					}
 
 					.actions {
@@ -1947,7 +1966,7 @@ export function registerChatActions() {
 						color: var(--vscode-gitDecoration-deletedResourceForeground);
 					}
 
-					.step-list {
+					.control-stack {
 						display: flex;
 						flex-direction: column;
 						gap: 8px;
@@ -1955,95 +1974,216 @@ export function registerChatActions() {
 
 					.plan-workspace {
 						display: grid;
-						grid-template-columns: minmax(0, 1fr) minmax(320px, 0.74fr);
-						gap: 18px;
+						grid-template-columns: minmax(0, 1fr);
+						gap: 12px;
 						align-items: start;
 					}
 
-					.plan-overview h2 {
+					.plan-workspace.controls-open {
+						grid-template-columns: minmax(320px, 1fr) minmax(260px, 340px);
+					}
+
+					.plan-canvas {
+						border: 1px solid var(--vscode-editorWidget-border);
+						border-radius: 6px;
+						background: var(--vscode-editor-background);
+						padding: 12px;
+						min-height: 60vh;
+						min-width: 0;
+					}
+
+					.plan-canvas h2 {
 						margin-top: 0;
+					}
+
+					.plan-canvas .markdown {
+						border-left: 0;
+						padding-left: 0;
+					}
+
+					.plan-markdown {
+						box-sizing: border-box;
+						min-height: 56vh;
+						padding: 10px 12px;
+						border: 1px solid var(--vscode-input-border);
+						border-radius: 4px;
+						background: var(--vscode-editor-background);
+						color: var(--vscode-editor-foreground);
+						overflow-wrap: anywhere;
+					}
+
+					.plan-markdown h2,
+					.plan-markdown h3,
+					.plan-markdown p,
+					.plan-markdown li {
+						border-left: 3px solid transparent;
+						padding-left: 6px;
+					}
+
+					.plan-markdown h2 {
+						margin: 10px 0 6px;
+						font-size: 16px;
+					}
+
+					.plan-markdown h3 {
+						margin: 8px 0 4px;
+						font-size: 14px;
+					}
+
+					.plan-markdown p {
+						margin: 5px 0;
+					}
+
+					.plan-step-line {
+						cursor: pointer;
+						border-radius: 4px;
+						position: relative;
+						padding-right: 72px;
+					}
+
+					.plan-step-line:hover,
+					.plan-step-line:focus-within {
+						background: var(--vscode-list-hoverBackground);
+					}
+
+					.plan-step-line.plan-step-kind-step:hover,
+					.plan-step-line.plan-step-kind-step:focus-within {
+						border-left-color: var(--vscode-focusBorder);
+					}
+
+					.plan-step-line.plan-step-kind-verification:hover,
+					.plan-step-line.plan-step-kind-verification:focus-within {
+						border-left-color: var(--vscode-testing-iconPassed);
+					}
+
+					.plan-step-line.plan-step-kind-decision:hover,
+					.plan-step-line.plan-step-kind-decision:focus-within {
+						border-left-color: var(--vscode-charts-yellow);
+					}
+
+					.plan-step-line.plan-step-kind-guardrail:hover,
+					.plan-step-line.plan-step-kind-guardrail:focus-within {
+						border-left-color: var(--vscode-editorWarning-foreground);
+					}
+
+					.plan-step-action {
+						position: absolute;
+						right: 4px;
+						top: 50%;
+						transform: translateY(-50%);
+						min-height: 22px;
+						border: 1px solid var(--vscode-button-border, transparent);
+						border-radius: 4px;
+						padding: 2px 7px;
+						color: var(--vscode-button-secondaryForeground);
+						background: var(--vscode-button-secondaryBackground);
+						opacity: 0;
+						pointer-events: none;
+						cursor: pointer;
+					}
+
+					.plan-step-line:hover .plan-step-action,
+					.plan-step-line:focus-within .plan-step-action {
+						opacity: 1;
+						pointer-events: auto;
+					}
+
+					.plan-change-highlight {
+						background: var(--vscode-editorInfo-background);
+						border-left-color: var(--vscode-editorInfo-foreground) !important;
 					}
 
 					.plan-editor-panel {
 						border: 1px solid var(--vscode-editorWidget-border);
 						border-radius: 6px;
 						background: var(--vscode-sideBar-background);
-						padding: 14px;
+						padding: 10px;
 						position: sticky;
 						top: 16px;
+						max-height: calc(100vh - 32px);
+						overflow: auto;
 					}
 
 					.plan-editor-panel h2 {
 						margin-top: 0;
 					}
 
-					.step-button {
-						display: block;
-						width: 100%;
+					.plan-editor-header {
+						display: flex;
+						gap: 8px;
+						align-items: center;
+						justify-content: space-between;
+						margin-bottom: 10px;
+					}
+
+					.plan-editor-header h2 {
+						margin: 0;
+					}
+
+					.control-card {
 						border: 1px solid var(--vscode-editorWidget-border);
 						border-radius: 6px;
-						background: var(--vscode-sideBar-background);
-						color: var(--vscode-editor-foreground);
-						padding: 12px;
-						text-align: left;
-						cursor: pointer;
+						background: var(--vscode-editor-background);
+						padding: 8px;
 					}
 
-					.step-button:hover:not(:disabled),
-					.step-button.active {
-						border-color: var(--vscode-focusBorder);
-						background: var(--vscode-list-hoverBackground);
+					.control-card h3 {
+						margin: 0 0 8px;
+						font-size: 13px;
+						font-weight: 600;
 					}
 
-					.step-button:disabled {
-						cursor: default;
+					.selected-step {
+						display: flex;
+						align-items: center;
+						gap: 8px;
+						margin-bottom: 10px;
 					}
 
-					.step-button.active {
-						outline: 1px solid var(--vscode-focusBorder);
-					}
-
-					.step-title {
-						display: grid;
-						grid-template-columns: 28px minmax(0, 1fr);
-						gap: 10px;
-						align-items: start;
-						margin-bottom: 8px;
-					}
-
-					.step-index {
+					.selected-step-index {
 						display: inline-flex;
 						align-items: center;
 						justify-content: center;
-						width: 24px;
-						height: 24px;
+						width: 22px;
+						height: 22px;
 						border-radius: 50%;
 						background: var(--vscode-badge-background);
 						color: var(--vscode-badge-foreground);
 						font-size: 12px;
 						font-weight: 600;
+						flex: 0 0 auto;
 					}
 
-					.step-markdown {
-						margin-left: 38px;
-						color: var(--vscode-descriptionForeground);
+					.selected-step-title {
+						min-width: 0;
+						font-weight: 600;
+						overflow: hidden;
+						text-overflow: ellipsis;
+						white-space: nowrap;
 					}
 
-					.selected-step-detail {
-						margin: 8px 0 12px;
+					.selected-plan-part {
+						margin: -4px 0 10px 30px;
 						color: var(--vscode-descriptionForeground);
+						font-size: 12px;
+						overflow-wrap: anywhere;
+					}
+
+					.control-note {
+						color: var(--vscode-descriptionForeground);
+						margin: 0;
 					}
 
 					.question-stack {
 						display: flex;
 						flex-direction: column;
-						gap: 12px;
+						gap: 8px;
 					}
 
 					.question-block {
 						margin: 0;
 						border-top: 1px solid var(--vscode-editorWidget-border);
-						padding-top: 10px;
+						padding-top: 8px;
 					}
 
 					.question-title {
@@ -2058,20 +2198,33 @@ export function registerChatActions() {
 						overflow-wrap: anywhere;
 					}
 
-					.option-list,
-					.decision-list {
+					.option-list {
 						display: flex;
 						flex-wrap: wrap;
-						gap: 8px 14px;
-						margin-top: 8px;
+						gap: 6px 10px;
+						margin-top: 6px;
 					}
 
-					label.option,
-					label.decision {
+					label.option {
 						display: inline-flex;
 						gap: 6px;
 						align-items: center;
 						max-width: 100%;
+						border: 1px solid var(--vscode-editorWidget-border);
+						border-radius: 4px;
+						padding: 4px 7px;
+						background: var(--vscode-sideBar-background);
+						cursor: pointer;
+					}
+
+					label.option:hover {
+						border-color: var(--vscode-focusBorder);
+					}
+
+					label.option:has(input:checked) {
+						border-color: var(--vscode-focusBorder);
+						background: var(--vscode-list-activeSelectionBackground);
+						color: var(--vscode-list-activeSelectionForeground);
 					}
 
 					textarea {
@@ -2088,16 +2241,8 @@ export function registerChatActions() {
 					}
 
 					.text-answer,
-					.freeform-answer,
-					.step-note,
-					.additional {
+					.freeform-answer {
 						margin-top: 8px;
-					}
-
-					.field-label {
-						display: block;
-						margin: 12px 0 5px;
-						font-weight: 600;
 					}
 
 					@media (max-width: 560px) {
@@ -2113,16 +2258,15 @@ export function registerChatActions() {
 							justify-content: flex-start;
 							margin-top: 12px;
 						}
-
-						.step-markdown,
 						.question-block {
 							margin-left: 0;
 						}
 					}
 
-					@media (max-width: 860px) {
-						.plan-workspace {
-							grid-template-columns: 1fr;
+					@media (max-width: 640px) {
+						.plan-workspace,
+						.plan-workspace.controls-open {
+							grid-template-columns: minmax(0, 1fr);
 						}
 
 						.plan-editor-panel {
@@ -2136,10 +2280,22 @@ export function registerChatActions() {
 				<script nonce="${nonce}">
 					const vscode = acquireVsCodeApi();
 					const data = ${toWebviewScriptLiteral(data)};
-					const savedState = vscode.getState?.() || {};
+					const previousState = vscode.getState?.() || {};
+					const savedState = previousState.planStateKey === data.stateKey ? previousState : { planStateKey: data.stateKey };
+					if (!data.currentPlanText && typeof savedState.currentPlanText === 'string') {
+						data.currentPlanText = savedState.currentPlanText;
+					}
+					if (!data.previousPlanText && typeof savedState.previousPlanText === 'string') {
+						data.previousPlanText = savedState.previousPlanText;
+					}
+					savedState.currentPlanText = data.currentPlanText;
+					savedState.previousPlanText = data.previousPlanText;
+					savedState.controlsStateKey = data.controlsStateKey;
 					const root = document.getElementById('app');
 					const controlMap = new Map();
 					let submitted = savedState.submitted === true;
+					let selectedStepId = savedState.selectedStepId;
+					let controlsOpen = savedState.controlsOpen === true && data.canSubmit;
 					document.addEventListener('input', markDirty, true);
 					document.addEventListener('change', markDirty, true);
 
@@ -2176,103 +2332,345 @@ export function registerChatActions() {
 						const header = el('header', 'plan-header');
 						const title = el('h1', undefined, data.labels.title);
 						header.appendChild(title);
-						const actions = el('div', 'actions');
-						const continueButton = el('button', 'button secondary', data.labels.continue);
-						const applyButton = el('button', 'button', data.labels.applyEdits);
-						continueButton.type = 'button';
-						applyButton.type = 'button';
-						continueButton.disabled = !data.canSubmit || submitted;
-						applyButton.disabled = !data.canSubmit || submitted || !hasEdits();
-						continueButton.addEventListener('click', () => submit('continue'));
-						applyButton.addEventListener('click', () => submit('apply'));
-						actions.appendChild(continueButton);
-						actions.appendChild(applyButton);
-						header.appendChild(actions);
 						shell.appendChild(header);
 
-						if (!data.canSubmit) {
-							shell.appendChild(el('div', 'readonly', data.labels.readOnly));
-						}
+						const workspace = el('section', controlsOpen ? 'plan-workspace controls-open' : 'plan-workspace');
 
-						if (data.changeSummary && (data.changeSummary.added?.length || data.changeSummary.removed?.length)) {
-							shell.appendChild(el('h2', undefined, data.labels.changes));
-							const diff = el('div', 'diff');
-							for (const line of data.changeSummary.added || []) {
-								diff.appendChild(el('div', 'diff-line added', '+ ' + line));
-							}
-							for (const line of data.changeSummary.removed || []) {
-								diff.appendChild(el('div', 'diff-line removed', '- ' + line));
-							}
-							shell.appendChild(diff);
+						const canvas = el('section', 'plan-canvas');
+						canvas.appendChild(el('h2', undefined, data.labels.planCanvas));
+						const diff = renderChangeSummary();
+						if (diff) {
+							canvas.appendChild(diff);
 						}
+						const planCanvas = el('div', 'plan-markdown');
+						planCanvas.id = 'plan-markdown';
+						renderPlanCanvas(planCanvas, data.currentPlanText, getChangedLineSet(data.currentPlanText, data.previousPlanText));
+						canvas.appendChild(planCanvas);
+						workspace.appendChild(canvas);
 
-						const selectedStep = getSelectedStep();
-						const workspace = el('section', 'plan-workspace');
-						const overview = el('section', 'plan-overview');
-						overview.appendChild(el('h2', undefined, data.labels.currentPlan));
-						const steps = el('div', 'step-list');
-						for (const step of data.steps) {
-							steps.appendChild(renderStepSummary(step, selectedStep?.id === step.id));
-						}
-						overview.appendChild(steps);
-						workspace.appendChild(overview);
+						if (controlsOpen) {
+							const editorPanel = el('aside', 'plan-editor-panel');
+							const editorHeader = el('div', 'plan-editor-header');
+							editorHeader.appendChild(el('h2', undefined, data.labels.inlineQuestions));
+							const closeButton = el('button', 'button secondary', data.labels.closeControls);
+							closeButton.type = 'button';
+							closeButton.addEventListener('click', closeControls);
+							editorHeader.appendChild(closeButton);
+							editorPanel.appendChild(editorHeader);
+							const controlsHost = el('div');
+							controlsHost.id = 'plan-editor-controls';
+							renderSelectedStepControls(controlsHost);
+							editorPanel.appendChild(controlsHost);
 
-						const editorPanel = el('aside', 'plan-editor-panel');
-						if (selectedStep) {
-							renderSelectedStepEditor(editorPanel, selectedStep);
+							const actions = el('div', 'actions');
+							const regenerateControlsButton = el('button', 'button secondary', data.labels.regenerateControls);
+							const continueButton = el('button', 'button secondary', data.labels.continue);
+							const applyButton = el('button', 'button apply-button', data.labels.applyEdits);
+							regenerateControlsButton.type = 'button';
+							continueButton.type = 'button';
+							applyButton.type = 'button';
+							regenerateControlsButton.disabled = submitted;
+							continueButton.disabled = submitted;
+							applyButton.disabled = submitted || !hasEdits();
+							regenerateControlsButton.addEventListener('click', () => submit('regenerateControls'));
+							continueButton.addEventListener('click', () => submit('continue'));
+							applyButton.addEventListener('click', () => submit('apply'));
+							actions.appendChild(regenerateControlsButton);
+							actions.appendChild(continueButton);
+							actions.appendChild(applyButton);
+							editorPanel.appendChild(actions);
+							workspace.appendChild(editorPanel);
 						}
-						workspace.appendChild(editorPanel);
 						shell.appendChild(workspace);
-
-						const additionalLabel = el('label', 'field-label', data.labels.additionalEdits);
-						additionalLabel.htmlFor = 'plan-editor-additional';
-						shell.appendChild(additionalLabel);
-						const additional = el('textarea', 'additional');
-						additional.id = 'plan-editor-additional';
-						additional.dataset.answerKey = 'plan-editor-additional';
-						additional.rows = 3;
-						additional.value = savedState.additional || '';
-						additional.addEventListener('input', () => {
-							savedState.additional = additional.value;
-							persistState();
-							applyButton.disabled = !data.canSubmit || submitted || !hasEdits();
-						});
-						shell.appendChild(additional);
 
 						const status = el('div', 'status', submitted ? data.labels.submitted : '');
 						status.id = 'plan-status';
 						shell.appendChild(status);
-						controlMap.set('additional', additional);
 						updateApplyButton();
 						updateDisabledState();
 					}
 
-					function getSelectedStep() {
-						if (!data.steps?.length) {
+					function renderChangeSummary() {
+						if (!data.changeSummary || !(data.changeSummary.added?.length || data.changeSummary.removed?.length)) {
 							return undefined;
 						}
-						const selected = data.steps.find(step => step.id === savedState.selectedStepId);
-						return selected || data.steps[0];
+
+						const section = el('section');
+						section.appendChild(el('h3', undefined, data.labels.changes));
+						const diff = el('div', 'diff');
+						for (const line of data.changeSummary.added || []) {
+							diff.appendChild(el('div', 'diff-line added', '+ ' + line));
+						}
+						for (const line of data.changeSummary.removed || []) {
+							diff.appendChild(el('div', 'diff-line removed', '- ' + line));
+						}
+						section.appendChild(diff);
+						return section;
 					}
 
-					function selectStep(step) {
-						savedState.selectedStepId = step.id;
+					function normalizeLine(text) {
+						return String(text || '').trim().replace(/\\s+/g, ' ');
+					}
+
+					function getChangedLineSet(text, previousText) {
+						if (!previousText) {
+							return new Set();
+						}
+						const previousLines = new Set(String(previousText || '').split(/\\r?\\n/g).map(normalizeLine).filter(Boolean));
+						return new Set(String(text || '').split(/\\r?\\n/g).map(normalizeLine).filter(line => line && !previousLines.has(line)));
+					}
+
+					function markIfChanged(node, raw, changedLines) {
+						if (changedLines?.has(normalizeLine(raw))) {
+							node.classList.add('plan-change-highlight');
+						}
+						return node;
+					}
+
+					function withMarkdownPrefix(node, prefix) {
+						node.dataset.markdownPrefix = prefix;
+						return node;
+					}
+
+					function appendEditableBlock(container, node, raw, changedLines) {
+						container.appendChild(markIfChanged(node, raw, changedLines));
+					}
+
+					function selectStep(stepId, selectedPart) {
+						const shouldRender = !controlsOpen;
+						controlsOpen = true;
+						savedState.controlsOpen = true;
+						selectedStepId = stepId;
+						savedState.selectedStepId = stepId;
+						if (selectedPart) {
+							savedState.selectedPartByStep = savedState.selectedPartByStep || {};
+							savedState.selectedPartByStep[stepId] = selectedPart;
+						}
+						persistState();
+						if (shouldRender) {
+							render();
+						} else {
+							updateSelectedStepRendering();
+						}
+					}
+
+					function closeControls() {
+						controlsOpen = false;
+						savedState.controlsOpen = false;
 						persistState();
 						render();
 					}
 
-					function renderMarkdown(container, text) {
+					function clearRenderedStepControls() {
+						for (const key of Array.from(controlMap.keys())) {
+							if (String(key).startsWith('plan-editor-step-custom-') || String(key).startsWith('plan-editor-question-')) {
+								controlMap.delete(key);
+							}
+						}
+					}
+
+					function updateSelectedStepRendering() {
+						for (const node of document.querySelectorAll('.plan-step-line.active')) {
+							node.classList.remove('active');
+						}
+						for (const node of document.querySelectorAll('.plan-step-line')) {
+							if (node.dataset.stepId === selectedStepId) {
+								node.classList.add('active');
+							}
+						}
+						const controlsHost = document.getElementById('plan-editor-controls');
+						if (controlsHost) {
+							clearRenderedStepControls();
+							controlsHost.textContent = '';
+							renderSelectedStepControls(controlsHost);
+						}
+						updateApplyButton();
+						updateDisabledState();
+					}
+
+					function normalizeComparableText(text) {
+						return normalizeLine(String(text || '')
+							.replace(/^\\s{0,3}(?:(?:[-*+])\\s+|\\d+[.)]\\s+)/, '')
+							.replace(/^#{1,6}\\s+/, '')
+							.replace(/\\*\\*/g, ''));
+					}
+
+					function tokenOverlapScore(left, right) {
+						const leftTokens = new Set(normalizeComparableText(left).toLowerCase().match(/[a-z0-9]{4,}/g) || []);
+						const rightTokens = new Set(normalizeComparableText(right).toLowerCase().match(/[a-z0-9]{4,}/g) || []);
+						let score = 0;
+						for (const token of leftTokens) {
+							if (rightTokens.has(token)) {
+								score++;
+							}
+						}
+						return score;
+					}
+
+					function getPlanCanvasSectionKind(title) {
+						if (/\\b(step|steps|implementation|approach|tasks?|work plan|execution)\\b/i.test(title || '')) {
+							return 'step';
+						}
+						if (/\\b(verification|validate|validation|tests?|checks?|qa)\\b/i.test(title || '')) {
+							return 'verification';
+						}
+						if (/\\b(decisions?|questions?|open items?|clarifications?)\\b/i.test(title || '')) {
+							return 'decision';
+						}
+						if (/\\b(risks?|guardrails?|constraints?|assumptions?)\\b/i.test(title || '')) {
+							return 'guardrail';
+						}
+						if (/\\b(relevant files?|files?|context|references?|dependencies?)\\b/i.test(title || '')) {
+							return 'other';
+						}
+						return 'step';
+					}
+
+					function isActionablePlanSection(kind) {
+						return !!kind && kind !== 'other';
+					}
+
+					function getDisplayHeadingTitle(title) {
+						return String(title || '').replace(/^plan\\s*:\\s*/i, '').trim() || title;
+					}
+
+					function getStepForLine(raw, currentSectionTitle, currentSectionKind) {
+						if (!isActionablePlanSection(currentSectionKind)) {
+							return undefined;
+						}
+
+						const normalizedLine = normalizeLine(String(raw || '').replace(/^\\s{0,3}(?:(?:[-*+])\\s+|\\d+[.)]\\s+)/, '').replace(/\\*\\*/g, ''));
+						if (!normalizedLine) {
+							return undefined;
+						}
+
+						let bestStep;
+						let bestScore = 0;
+						const normalizedCurrentSection = normalizeComparableText(currentSectionTitle);
+						for (const step of data.steps) {
+							if (step.kind === 'other') {
+								continue;
+							}
+							const label = normalizeComparableText(step.label);
+							const text = normalizeComparableText(step.text);
+							const section = normalizeComparableText(step.sectionTitle);
+							let score = tokenOverlapScore(normalizedLine, [section, label, text].filter(Boolean).join(' '));
+							if (label && (normalizedLine === label || normalizedLine.includes(label) || label.includes(normalizedLine))) {
+								score += 20;
+							}
+							if (text && (text.includes(normalizedLine) || normalizedLine.includes(text))) {
+								score += 12;
+							}
+							if (section && normalizedCurrentSection && (section === normalizedCurrentSection || section.includes(normalizedCurrentSection) || normalizedCurrentSection.includes(section))) {
+								score += 4;
+							}
+							if (step.kind === currentSectionKind) {
+								score += 6;
+							} else {
+								score -= 4;
+							}
+							if (score > bestScore) {
+								bestScore = score;
+								bestStep = step;
+							}
+						}
+						return bestScore >= 8 ? bestStep : undefined;
+					}
+
+					function getActionablePlanSteps() {
+						return data.steps.filter(step => step.kind !== 'other');
+					}
+
+					function markStepNode(node, raw, step) {
+						if (!data.canSubmit || !step) {
+							return node;
+						}
+
+						const selectedPart = (normalizeComparableText(raw) || step.label).slice(0, 240);
+						node.classList.add('plan-step-line');
+						node.classList.add('plan-step-kind-' + (step.kind || 'step'));
+						if (selectedStepId === step.id) {
+							node.classList.add('active');
+						}
+						node.tabIndex = 0;
+						node.setAttribute('role', 'button');
+						node.dataset.stepId = step.id;
+						node.dataset.selectedPart = selectedPart;
+						node.addEventListener('click', () => selectStep(step.id, selectedPart));
+						node.addEventListener('keydown', event => {
+							if (event.key === 'Enter' || event.key === ' ') {
+								event.preventDefault();
+								selectStep(step.id, selectedPart);
+							}
+						});
+						const action = el('button', 'plan-step-action', data.labels.changeThisPart);
+						action.type = 'button';
+						action.addEventListener('click', event => {
+							event.stopPropagation();
+							selectStep(step.id, selectedPart);
+						});
+						node.appendChild(action);
+						return node;
+					}
+
+					function appendInlineMarkdown(container, text) {
+						const value = String(text || '');
+						const tokenPattern = /(\\x60[^\\x60]+\\x60|\\*\\*[^*]+\\*\\*)/g;
+						let lastIndex = 0;
+						let match = tokenPattern.exec(value);
+						while (match) {
+							if (match.index > lastIndex) {
+								container.appendChild(document.createTextNode(value.slice(lastIndex, match.index)));
+							}
+							const token = match[0];
+							if (token.startsWith('\\x60')) {
+								container.appendChild(el('code', undefined, token.slice(1, -1)));
+							} else {
+								container.appendChild(el('strong', undefined, token.slice(2, -2)));
+							}
+							lastIndex = match.index + token.length;
+							match = tokenPattern.exec(value);
+						}
+						if (lastIndex < value.length) {
+							container.appendChild(document.createTextNode(value.slice(lastIndex)));
+						}
+						return container;
+					}
+
+					function inlineMarkdownElement(tag, className, text) {
+						return appendInlineMarkdown(el(tag, className), text);
+					}
+
+					function renderPlanCanvas(container, text, changedLines = new Set()) {
+						container.textContent = '';
 						const lines = String(text || '').split(/\\r?\\n/g);
+						const actionableSteps = getActionablePlanSteps();
+						let nextActionableStepIndex = 0;
 						let list;
 						let pre;
+						let orderedIndex = 1;
+						let currentSectionTitle = '';
+						let currentSectionKind = '';
+						function getStepForActionableRow(rowText) {
+							const matchedStep = getStepForLine(rowText, currentSectionTitle, currentSectionKind);
+							if (matchedStep) {
+								const matchedIndex = actionableSteps.findIndex(step => step.id === matchedStep.id);
+								if (matchedIndex >= nextActionableStepIndex) {
+									nextActionableStepIndex = matchedIndex + 1;
+								}
+								return matchedStep;
+							}
+
+							return actionableSteps[nextActionableStepIndex++];
+						}
 						for (const raw of lines) {
 							const line = raw.trimEnd();
 							if (line.startsWith('\\x60\\x60\\x60')) {
 								if (pre) {
-									container.appendChild(pre);
+									appendEditableBlock(container, pre, pre.textContent || currentSectionTitle, changedLines);
 									pre = undefined;
 								} else {
-									pre = el('pre');
+									pre = withMarkdownPrefix(el('pre'), '\\x60\\x60\\x60');
 									pre.textContent = '';
 								}
 								continue;
@@ -2282,74 +2680,122 @@ export function registerChatActions() {
 								continue;
 							}
 							if (!line.trim()) {
-								list = undefined;
+								if (!isActionablePlanSection(currentSectionKind)) {
+									list = undefined;
+									orderedIndex = 1;
+								}
 								continue;
 							}
 							const heading = /^(#{1,6})\\s+(.+)$/.exec(line);
 							if (heading) {
 								list = undefined;
-								container.appendChild(el(heading[1].length <= 2 ? 'h2' : 'h3', undefined, heading[2]));
+								orderedIndex = 1;
+								currentSectionTitle = heading[2].replace(/#+\\s*$/, '').trim();
+								currentSectionKind = /^plan\\b/i.test(currentSectionTitle) ? '' : getPlanCanvasSectionKind(currentSectionTitle);
+								appendEditableBlock(container, withMarkdownPrefix(inlineMarkdownElement(heading[1].length <= 2 ? 'h2' : 'h3', undefined, getDisplayHeadingTitle(currentSectionTitle)), heading[1] + ' '), raw, changedLines);
+								continue;
+							}
+							const boldSection = /^\\*\\*(.+?)\\*\\*\\s*:?$/.exec(line.trim());
+							if (boldSection) {
+								list = undefined;
+								orderedIndex = 1;
+								currentSectionTitle = boldSection[1].trim();
+								currentSectionKind = /^plan\\b/i.test(currentSectionTitle) ? '' : getPlanCanvasSectionKind(currentSectionTitle);
+								appendEditableBlock(container, inlineMarkdownElement('h2', undefined, getDisplayHeadingTitle(currentSectionTitle)), raw, changedLines);
+								continue;
+							}
+							const planTitle = /^Plan\\s*:\\s*(.+)$/i.exec(line.trim());
+							if (planTitle) {
+								list = undefined;
+								orderedIndex = 1;
+								currentSectionTitle = '';
+								currentSectionKind = '';
+								appendEditableBlock(container, inlineMarkdownElement('h2', undefined, planTitle[1].trim()), raw, changedLines);
 								continue;
 							}
 							const ordered = /^\\d+[.)]\\s+(.+)$/.exec(line.trim());
 							const unordered = /^[-*+]\\s+(.+)$/.exec(line.trim());
 							if (ordered || unordered) {
-								const listType = ordered ? 'ol' : 'ul';
+								const listType = isActionablePlanSection(currentSectionKind) || ordered ? 'ol' : 'ul';
 								if (!list || list.tagName.toLowerCase() !== listType) {
 									list = el(listType);
 									container.appendChild(list);
+									orderedIndex = 1;
 								}
-								list.appendChild(el('li', undefined, (ordered || unordered)[1]));
+								const itemPrefix = ordered ? String(orderedIndex++) + '. ' : '- ';
+								const itemText = (ordered || unordered)[1];
+								const currentStep = isActionablePlanSection(currentSectionKind) ? getStepForActionableRow(itemText) : undefined;
+								list.appendChild(markIfChanged(markStepNode(withMarkdownPrefix(inlineMarkdownElement('li', undefined, itemText), itemPrefix), itemText, currentStep), raw, changedLines));
+								continue;
+							}
+							if (isActionablePlanSection(currentSectionKind)) {
+								if (!list || list.tagName.toLowerCase() !== 'ol') {
+									list = el('ol');
+									container.appendChild(list);
+									orderedIndex = 1;
+								}
+								const currentStep = getStepForActionableRow(line);
+								list.appendChild(markIfChanged(markStepNode(withMarkdownPrefix(inlineMarkdownElement('li', undefined, line), String(orderedIndex++) + '. '), line, currentStep), raw, changedLines));
 								continue;
 							}
 							list = undefined;
-							container.appendChild(el('p', undefined, line));
+							orderedIndex = 1;
+							appendEditableBlock(container, withMarkdownPrefix(inlineMarkdownElement('p', undefined, line), ''), raw, changedLines);
 						}
 						if (pre) {
-							container.appendChild(pre);
+							appendEditableBlock(container, pre, pre.textContent || currentSectionTitle, changedLines);
 						}
 					}
 
-					function renderStepSummary(step, active) {
-						const article = el('button', active ? 'step-button active' : 'step-button');
-						article.type = 'button';
-						article.disabled = submitted;
-						article.addEventListener('click', () => selectStep(step));
-						const title = el('div', 'step-title');
-						title.appendChild(el('span', 'step-index', String(step.index)));
-						const headingText = step.sectionTitle && step.kind !== 'step'
-							? step.sectionTitle + ': ' + step.label
-							: step.label;
-						title.appendChild(el('h3', undefined, headingText));
-						article.appendChild(title);
-						if (step.text && step.text !== step.label) {
-							const stepMarkdown = el('div', 'markdown step-markdown');
-							renderMarkdown(stepMarkdown, step.text);
-							article.appendChild(stepMarkdown);
+					function renderSelectedStepControls(container) {
+						const selectedStep = data.steps.find(step => step.id === selectedStepId);
+						if (!selectedStep) {
+							container.appendChild(el('p', 'control-note', data.labels.chooseStep));
+							return;
 						}
-						return article;
-					}
 
-					function renderSelectedStepEditor(container, step) {
-						container.appendChild(el('h2', undefined, data.labels.editSection));
-						const title = el('div', 'step-title');
-						title.appendChild(el('span', 'step-index', String(step.index)));
-						const headingText = step.sectionTitle && step.kind !== 'step'
-							? step.sectionTitle + ': ' + step.label
-							: step.label;
-						title.appendChild(el('h3', undefined, headingText));
-						container.appendChild(title);
-						if (step.text && step.text !== step.label) {
-							const stepMarkdown = el('div', 'markdown selected-step-detail');
-							renderMarkdown(stepMarkdown, step.text);
-							container.appendChild(stepMarkdown);
+						const header = el('div', 'selected-step');
+						header.appendChild(el('span', 'selected-step-index', String(selectedStep.index)));
+						header.appendChild(el('div', 'selected-step-title', selectedStep.label));
+						container.appendChild(header);
+						const selectedPart = savedState.selectedPartByStep?.[selectedStep.id];
+						if (selectedPart && selectedPart !== selectedStep.label) {
+							container.appendChild(el('div', 'selected-plan-part', selectedPart));
 						}
+
+						const card = el('section', 'control-card');
 						const stack = el('div', 'question-stack');
-						for (const question of step.questions || []) {
-							stack.appendChild(renderQuestion(step, question));
+						if (!(selectedStep.questions || []).length) {
+							stack.appendChild(el('p', 'control-note', data.labels.noGeneratedControls));
 						}
-						stack.appendChild(renderStepDecision(step));
-						container.appendChild(stack);
+						for (const question of selectedStep.questions || []) {
+							stack.appendChild(renderQuestion(selectedStep, question));
+						}
+						stack.appendChild(renderStepOpenResponse(selectedStep));
+						card.appendChild(stack);
+						container.appendChild(card);
+					}
+
+					function renderStepOpenResponse(step) {
+						const key = 'plan-editor-step-custom-' + step.id;
+						const block = el('div', 'question-block');
+						const label = el('label', 'question-title', data.labels.changeSomethingElse);
+						label.htmlFor = key;
+						block.appendChild(label);
+						const textarea = el('textarea', 'freeform-answer');
+						textarea.id = key;
+						textarea.dataset.answerKey = key;
+						textarea.rows = 3;
+						textarea.placeholder = data.labels.changeSomethingElsePlaceholder;
+						textarea.value = savedState[key] || '';
+						textarea.addEventListener('input', () => {
+							savedState[key] = textarea.value;
+							persistState();
+							updateApplyButton();
+						});
+						controlMap.set(key, { text: textarea });
+						block.appendChild(textarea);
+						return block;
 					}
 
 					function renderQuestion(step, question) {
@@ -2402,7 +2848,7 @@ export function registerChatActions() {
 						freeform.rows = 2;
 						freeform.value = saved?.freeformValue || '';
 						freeform.disabled = question.allowFreeformInput === false;
-						freeform.placeholder = data.labels.freeform;
+						freeform.placeholder = data.labels.changeSomethingElsePlaceholder;
 						freeform.addEventListener('input', () => {
 							saveQuestionChoiceState(key, question);
 							updateApplyButton();
@@ -2413,63 +2859,6 @@ export function registerChatActions() {
 						controlMap.set(key, { question, optionList, freeform });
 						saveQuestionChoiceState(key, question, false);
 						return block;
-					}
-
-					function renderStepDecision(step) {
-						const key = 'plan-editor-step-' + step.id;
-						const section = el('div', 'question-block');
-						section.appendChild(el('div', 'question-title', data.labels.stepDecision));
-						const choices = el('div', 'decision-list');
-						const saved = savedState[key];
-						const selected = new Set(Array.isArray(saved?.selectedValues) ? saved.selectedValues : ['keep']);
-						for (const choice of [
-							['keep', data.labels.keep],
-							['revise', data.labels.revise],
-							['defer', data.labels.defer],
-							['split', data.labels.split],
-						]) {
-							const label = el('label', 'decision');
-							const input = document.createElement('input');
-							input.type = 'checkbox';
-							input.dataset.answerKey = key;
-							input.value = choice[0];
-							input.checked = selected.has(choice[0]);
-							input.addEventListener('change', () => {
-								if (choice[0] !== 'keep' && input.checked) {
-									for (const other of choices.querySelectorAll('input[value="keep"]')) {
-										other.checked = false;
-									}
-								}
-								if (choice[0] === 'keep' && input.checked) {
-									for (const other of choices.querySelectorAll('input:not([value="keep"])')) {
-										other.checked = false;
-									}
-								}
-								if (!choices.querySelector('input:checked')) {
-									choices.querySelector('input[value="keep"]').checked = true;
-								}
-								saveStepDecisionState(key);
-								updateApplyButton();
-							});
-							label.appendChild(input);
-							label.appendChild(document.createTextNode(choice[1]));
-							choices.appendChild(label);
-						}
-						section.appendChild(choices);
-						const noteLabel = el('label', 'field-label', data.labels.stepNotes);
-						const note = el('textarea', 'step-note');
-						note.dataset.answerKey = key;
-						note.rows = 2;
-						note.value = saved?.freeformValue || '';
-						note.addEventListener('input', () => {
-							saveStepDecisionState(key);
-							updateApplyButton();
-						});
-						section.appendChild(noteLabel);
-						section.appendChild(note);
-						controlMap.set(key, { choices, note });
-						saveStepDecisionState(key, false);
-						return section;
 					}
 
 					function saveQuestionChoiceState(key, question, persist = true) {
@@ -2498,30 +2887,16 @@ export function registerChatActions() {
 						}
 					}
 
-					function saveStepDecisionState(key, persist = true) {
-						const control = controlMap.get(key);
-						if (!control) {
-							return;
-						}
-						const selectedValues = Array.from(control.choices.querySelectorAll('input:checked')).map(input => input.value);
-						savedState[key] = {
-							selectedValues,
-							...(control.note.value.trim() ? { freeformValue: control.note.value.trim() } : {}),
-						};
-						if (persist) {
-							persistState();
-						}
-					}
-
 					function collectAnswers() {
 						const answers = {};
 						for (const step of data.steps) {
-							const stepKey = 'plan-editor-step-' + step.id;
-							if (isDirtyKey(stepKey)) {
-								saveStepDecisionState(stepKey, false);
-								const answer = savedState[stepKey];
-								if (answer?.selectedValues?.length || answer?.freeformValue) {
-									answers[stepKey] = answer;
+							let stepHasAnswer = false;
+							const stepCustomKey = 'plan-editor-step-custom-' + step.id;
+							if (isDirtyKey(stepCustomKey)) {
+								const value = controlMap.get(stepCustomKey)?.text?.value.trim() ?? (typeof savedState[stepCustomKey] === 'string' ? savedState[stepCustomKey].trim() : '');
+								if (value) {
+									answers[stepCustomKey] = value;
+									stepHasAnswer = true;
 								}
 							}
 							for (const question of step.questions || []) {
@@ -2534,6 +2909,7 @@ export function registerChatActions() {
 									const value = control?.text?.value.trim() ?? (typeof savedState[questionKey] === 'string' ? savedState[questionKey].trim() : '');
 									if (value) {
 										answers[questionKey] = value;
+										stepHasAnswer = true;
 									}
 								} else {
 									saveQuestionChoiceState(questionKey, question, false);
@@ -2541,16 +2917,18 @@ export function registerChatActions() {
 									if (question.type === 'singleSelect') {
 										if (answer?.selectedValue || answer?.freeformValue) {
 											answers[questionKey] = answer;
+											stepHasAnswer = true;
 										}
 									} else if (answer?.selectedValues?.length || answer?.freeformValue) {
 										answers[questionKey] = answer;
+										stepHasAnswer = true;
 									}
 								}
 							}
-						}
-						const additional = controlMap.get('additional')?.value.trim() ?? (typeof savedState.additional === 'string' ? savedState.additional.trim() : '');
-						if (isDirtyKey('plan-editor-additional') && additional) {
-							answers['plan-editor-additional'] = additional;
+							const selectedPart = savedState.selectedPartByStep?.[step.id];
+							if (stepHasAnswer && selectedPart) {
+								answers['plan-editor-selected-part-' + step.id] = selectedPart;
+							}
 						}
 						return answers;
 					}
@@ -2559,20 +2937,11 @@ export function registerChatActions() {
 						if (savedState.dirty !== true) {
 							return false;
 						}
-						const additional = controlMap.get('additional')?.value.trim() ?? (typeof savedState.additional === 'string' ? savedState.additional.trim() : '');
-						if (isDirtyKey('plan-editor-additional') && additional) {
-							return true;
-						}
 						for (const step of data.steps) {
-							const stepKey = 'plan-editor-step-' + step.id;
-							if (isDirtyKey(stepKey)) {
-								const control = controlMap.get(stepKey);
-								const saved = savedState[stepKey];
-								const selected = control
-									? Array.from(control.choices.querySelectorAll('input:checked')).map(input => input.value)
-									: Array.isArray(saved?.selectedValues) ? saved.selectedValues : [];
-								const note = control?.note?.value.trim() ?? (typeof saved?.freeformValue === 'string' ? saved.freeformValue.trim() : '');
-								if (selected.some(value => value !== 'keep') || note) {
+							const stepCustomKey = 'plan-editor-step-custom-' + step.id;
+							if (isDirtyKey(stepCustomKey)) {
+								const value = controlMap.get(stepCustomKey)?.text?.value.trim() ?? (typeof savedState[stepCustomKey] === 'string' ? savedState[stepCustomKey].trim() : '');
+								if (value) {
 									return true;
 								}
 							}
@@ -2605,7 +2974,7 @@ export function registerChatActions() {
 					}
 
 					function updateApplyButton() {
-						const button = document.querySelector('.button:not(.secondary)');
+						const button = document.querySelector('.apply-button');
 						if (button) {
 							button.disabled = !data.canSubmit || submitted || !hasEdits();
 						}
@@ -2625,13 +2994,20 @@ export function registerChatActions() {
 							return;
 						}
 						const answers = collectAnswers();
+						if (type === 'regenerateControls') {
+							answers[data.regenerateControlsAnswerKey] = data.regenerateControlsAnswerValue;
+						}
 						submitted = true;
 						savedState.submitted = true;
 						persistState();
 						updateDisabledState();
 						const status = document.getElementById('plan-status');
 						if (status) {
-							status.textContent = data.labels.submitted;
+							status.textContent = type === 'regenerateControls'
+								? data.labels.regeneratingControls
+								: type === 'apply'
+									? data.labels.applyingEdits
+									: data.labels.submitted;
 						}
 						vscode.postMessage({ type, answers });
 					}
@@ -2641,6 +3017,43 @@ export function registerChatActions() {
 					}
 
 					window.addEventListener('message', event => {
+						if (event.data?.type === 'planUpdate' && typeof event.data.planText === 'string') {
+							if (!event.data.planText.trim()) {
+								return;
+							}
+							const previousPlanText = typeof event.data.previousPlanText === 'string' ? event.data.previousPlanText : data.currentPlanText;
+							data.previousPlanText = previousPlanText;
+							data.currentPlanText = event.data.planText;
+							if (Array.isArray(event.data.planSteps)) {
+								data.steps = event.data.planSteps;
+								if (selectedStepId && !data.steps.some(step => step.id === selectedStepId)) {
+									selectedStepId = undefined;
+									savedState.selectedStepId = undefined;
+									savedState.selectedPartByStep = {};
+								}
+							}
+							if (typeof event.data.controlsStateKey === 'string') {
+								data.controlsStateKey = event.data.controlsStateKey;
+								savedState.controlsStateKey = data.controlsStateKey;
+							}
+							savedState.previousPlanText = data.previousPlanText;
+							savedState.currentPlanText = data.currentPlanText;
+							persistState();
+							const planMarkdown = document.getElementById('plan-markdown');
+							if (planMarkdown) {
+								renderPlanCanvas(planMarkdown, data.currentPlanText, getChangedLineSet(data.currentPlanText, data.previousPlanText));
+							}
+							if (controlsOpen) {
+								updateSelectedStepRendering();
+							}
+							const status = document.getElementById('plan-status');
+							if (status) {
+								status.textContent = !data.canSubmit && event.data.isComplete
+									? ''
+									: event.data.isComplete ? data.labels.submitted : data.labels.applyingEdits;
+							}
+							return;
+						}
 						if (event.data?.type === 'submitted') {
 							submitted = true;
 							savedState.submitted = true;
@@ -2664,6 +3077,7 @@ export function registerChatActions() {
 		const webviewWorkbenchService = accessor.get(IWebviewWorkbenchService);
 		const notificationService = accessor.get(INotificationService);
 		const sessionResource = revivePlanningSessionResource(args.sessionResource);
+		const webviewKey = sessionResource.toString();
 		const planText = args.planText ?? getPlanningPlanText(chatService, sessionResource, args.requestId);
 		const previousPlanText = args.previousPlanText ?? (args.previousRequestId ? getPlanningPlanText(chatService, sessionResource, args.previousRequestId) : undefined);
 		if (!planText) {
@@ -2672,21 +3086,28 @@ export function registerChatActions() {
 		}
 
 		const planSteps = getPlanningPlanEditorSteps(planText, args.planSteps);
-		const title = localize('openPlanningPlan.editorTitle', 'Planning Plan');
-		const webviewInput = webviewWorkbenchService.openWebview({
-			providedViewType: PLANNING_PLAN_WEBVIEW_VIEW_TYPE,
-			title,
-			options: {
-				purpose: WebviewContentPurpose.CustomEditor,
-				enableFindWidget: true,
-				retainContextWhenHidden: true,
-			},
-			contentOptions: {
-				allowScripts: true,
-				allowForms: true,
-			},
-			extension: undefined,
-		}, PLANNING_PLAN_WEBVIEW_VIEW_TYPE, title, undefined, { group });
+		const title = localize('openPlanningPlan.editorTitle', 'Plan Canvas');
+		const existing = planningPlanWebviews.get(webviewKey);
+		let webviewInput = existing?.input;
+		if (webviewInput && !webviewInput.isDisposed()) {
+			existing?.listener.dispose();
+			webviewWorkbenchService.revealWebview(webviewInput, group, false);
+		} else {
+			webviewInput = webviewWorkbenchService.openWebview({
+				providedViewType: PLANNING_PLAN_WEBVIEW_VIEW_TYPE,
+				title,
+				options: {
+					purpose: WebviewContentPurpose.CustomEditor,
+					enableFindWidget: true,
+					retainContextWhenHidden: true,
+				},
+				contentOptions: {
+					allowScripts: true,
+					allowForms: true,
+				},
+				extension: undefined,
+			}, PLANNING_PLAN_WEBVIEW_VIEW_TYPE, title, undefined, { group });
+		}
 
 		const listener = webviewInput.webview.onMessage(event => {
 			if (!isPlanningPlanWebviewSubmitMessage(event.message)) {
@@ -2698,10 +3119,52 @@ export function registerChatActions() {
 			}
 
 			chatService.notifyQuestionCarouselAnswer(args.requestId, args.planEditorResolveId, event.message.answers);
-			void webviewInput.webview.postMessage({ type: 'submitted' });
+			if (event.message.type === 'continue') {
+				void webviewInput.webview.postMessage({ type: 'submitted' });
+			}
 		});
-		webviewInput.webview.onDidDispose(() => listener.dispose());
+		planningPlanWebviews.set(webviewKey, { input: webviewInput, listener });
+		webviewInput.webview.onDidDispose(() => {
+			listener.dispose();
+			if (planningPlanWebviews.get(webviewKey)?.input === webviewInput) {
+				planningPlanWebviews.delete(webviewKey);
+			}
+		});
 		webviewInput.webview.setHtml(buildPlanningPlanWebviewHtml(planText, previousPlanText, planSteps, !!args.planEditorResolveId));
+	}
+
+	async function updatePlanningPlanWebview(accessor: ServicesAccessor, args: IPlanningPlanUpdateCommandArgs | undefined): Promise<void> {
+		if (!args?.sessionResource || typeof args.planText !== 'string' || !isUsablePlanningPlanText(args.planText)) {
+			return;
+		}
+
+		const sessionResource = revivePlanningSessionResource(args.sessionResource);
+		const entry = planningPlanWebviews.get(sessionResource.toString());
+		if (!entry || entry.input.isDisposed()) {
+			if (entry?.input.isDisposed()) {
+				planningPlanWebviews.delete(sessionResource.toString());
+			}
+			if (args.requestId) {
+				await openPlanningPlanWebview(accessor, {
+					sessionResource,
+					requestId: args.requestId,
+					planText: args.planText,
+					previousPlanText: args.previousPlanText,
+					planSteps: args.planSteps,
+				}, ACTIVE_GROUP);
+			}
+			return;
+		}
+
+		const planSteps = getPlanningPlanEditorSteps(args.planText, args.planSteps);
+		await entry.input.webview.postMessage({
+			type: 'planUpdate',
+			planText: args.planText,
+			previousPlanText: args.previousPlanText && isUsablePlanningPlanText(args.previousPlanText) ? args.previousPlanText : undefined,
+			planSteps: planSteps.map(step => toPlanningPlanWebviewStep(step)),
+			controlsStateKey: getPlanningPlanControlsStateKey(planSteps),
+			isComplete: args.isComplete === true,
+		});
 	}
 
 	registerAction2(class OpenPlanningPlanAction extends Action2 {
@@ -2719,6 +3182,21 @@ export function registerChatActions() {
 				return;
 			}
 			await openPlanningPlanWebview(accessor, args, ACTIVE_GROUP);
+		}
+	});
+
+	registerAction2(class UpdatePlanningPlanAction extends Action2 {
+		constructor() {
+			super({
+				id: UPDATE_PLANNING_PLAN_ACTION_ID,
+				title: localize2('updatePlanningPlan', 'Update Current Plan Canvas'),
+				category: CHAT_CATEGORY,
+				f1: false,
+			});
+		}
+
+		override async run(accessor: ServicesAccessor, args?: IPlanningPlanUpdateCommandArgs): Promise<void> {
+			await updatePlanningPlanWebview(accessor, args);
 		}
 	});
 

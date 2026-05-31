@@ -7,7 +7,7 @@ import assert from 'assert';
 import { CancellationToken } from '../../../../../../base/common/cancellation.js';
 import { Event } from '../../../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
-import { generateDynamicPlanningQuestions } from '../../../browser/planning/chatPlanningQuestionGenerator.js';
+import { generateDynamicPlanningPlanStepControlsResult, generateDynamicPlanningQuestions } from '../../../browser/planning/chatPlanningQuestionGenerator.js';
 import { ChatMessageRole, IChatMessage, ILanguageModelsService } from '../../../common/languageModels.js';
 
 suite('ChatPlanningQuestionGenerator', () => {
@@ -266,6 +266,11 @@ suite('ChatPlanningQuestionGenerator', () => {
 		assert.strictEqual(questions[0].type, 'multiSelect');
 		assert.strictEqual(questions[0].title, 'Plan Step Priority');
 		assert.ok(capturedMessages, 'Expected a language-model request to be issued');
+		const systemPart = capturedMessages[0].content[0];
+		if (systemPart.type !== 'text') {
+			throw new Error('Expected system prompt text part');
+		}
+		assert.ok(systemPart.value.includes('titles under five words'));
 		const promptPart = capturedMessages[1].content[0];
 		if (promptPart.type !== 'text') {
 			throw new Error('Expected prompt text part');
@@ -275,6 +280,162 @@ suite('ChatPlanningQuestionGenerator', () => {
 		assert.ok(promptPart.value.includes('tighten the first plan into a stronger work breakdown'));
 		assert.ok(!promptPart.value.includes('co-create the high-level plan before the first detailed plan is built'));
 		assert.ok(!promptPart.value.includes('Include one assumption-confirmation question'));
+	});
+
+	test('generates distinct task controls keyed to each plan step', async () => {
+		let capturedModelId: string | undefined;
+		let capturedMessages: IChatMessage[] | undefined;
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['copilot-fast', 'plan-model'],
+			getVendors: () => [],
+			lookupLanguageModel: (modelId: string) => ({ id: modelId, family: modelId, capabilities: { toolCalling: true } }),
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async (selector: { readonly id?: string; readonly family?: string }) => selector.id === 'copilot-fast' || selector.family === 'copilot-fast' ? ['copilot-fast'] : [],
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async (modelId: string, _from: unknown, messages: IChatMessage[]) => {
+				capturedModelId = modelId;
+				capturedMessages = messages;
+				return {
+					stream: (async function* () {
+						yield {
+							type: 'text' as const,
+							value: JSON.stringify({
+								stepControls: [
+									{
+										stepIndex: 1,
+										questions: [
+											{
+												title: 'Loader Boundary',
+												message: 'How should this step limit the loader change?',
+												type: 'singleSelect',
+												allowFreeformInput: true,
+												defaultValue: 'Parameter only',
+												options: [
+													{ label: 'Parameter only', value: 'parameter-only' },
+													{ label: 'Trace first', value: 'trace-first' }
+												]
+											},
+											{
+												title: 'Loader Evidence',
+												message: 'Which evidence should confirm the loader path?',
+												type: 'singleSelect',
+												options: [
+													{ label: 'Call trace', value: 'call-trace' },
+													{ label: 'Path print', value: 'path-print' }
+												]
+											}
+										]
+									},
+									{
+										stepIndex: 2,
+										questions: [
+											{
+												title: 'Schema Checks',
+												message: 'Which validation should happen before modeling?',
+												type: 'singleSelect',
+												options: [
+													{ label: 'Required columns', value: 'required-columns' },
+													{ label: 'Types and columns', value: 'types-and-columns' }
+												]
+											},
+											{
+												title: 'NA Reporting',
+												message: 'How should missing values be reported?',
+												type: 'multiSelect',
+												options: [
+													{ label: 'By column', value: 'by-column' },
+													{ label: 'By condition', value: 'by-condition' }
+												]
+											}
+										]
+									},
+									{
+										stepIndex: 3,
+										questions: [
+											{
+												title: 'Validation Signal',
+												message: 'Which run should prove this step is done?',
+												type: 'singleSelect',
+												options: [
+													{ label: 'Unit test', value: 'unit-test' },
+													{ label: 'Script run', value: 'script-run' }
+												]
+											},
+											{
+												title: 'Output Check',
+												message: 'Which output should be inspected first?',
+												type: 'singleSelect',
+												options: [
+													{ label: 'CSV columns', value: 'csv-columns' },
+													{ label: 'Console verdict', value: 'console-verdict' }
+												]
+											}
+										]
+									}
+								]
+							})
+						};
+					})(),
+					result: Promise.resolve({})
+				};
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		const result = await generateDynamicPlanningPlanStepControlsResult(service, {
+			userRequest: 'Tighten this CSV analysis plan.',
+			modelId: undefined,
+			planningPhase: 'focused-slice',
+			questionStage: 'task-decomposition',
+			currentPlan: [
+				'Plan: CSV analysis',
+				'**Steps**',
+				'Confirm the input loader path.',
+				'Validate required CSV columns.',
+				'**Verification**',
+				'Run the script and inspect output.'
+			].join('\n'),
+			recentConversation: [],
+			planningAnswers: [{ question: 'Missing values', answer: 'Exclude rows with NA.' }],
+		}, [
+			{ index: 1, label: 'Confirm the input loader path.', text: 'Confirm the input loader path.', sectionTitle: 'Steps', kind: 'step' },
+			{ index: 2, label: 'Validate required CSV columns.', text: 'Validate required CSV columns.', sectionTitle: 'Steps', kind: 'step' },
+			{ index: 3, label: 'Run the script and inspect output.', text: 'Run the script and inspect output.', sectionTitle: 'Verification', kind: 'verification' },
+		], CancellationToken.None);
+
+		assert.strictEqual(capturedModelId, 'copilot-fast');
+		assert.strictEqual(result.questionsByStep.size, 3);
+		assert.deepStrictEqual(result.questionsByStep.get(1)?.map(question => question.title), ['Loader Boundary', 'Loader Evidence']);
+		assert.deepStrictEqual(result.questionsByStep.get(2)?.map(question => question.title), ['Schema Checks', 'NA Reporting']);
+		assert.deepStrictEqual(result.questionsByStep.get(3)?.map(question => question.title), ['Validation Signal', 'Output Check']);
+		for (const questions of result.questionsByStep.values()) {
+			assert.strictEqual(questions.length, 2);
+			assert.ok(questions.every(question => question.type !== 'text'));
+			assert.ok(questions.every(question => question.allowFreeformInput === false));
+			assert.ok(questions.every(question => question.defaultValue === undefined));
+		}
+		assert.ok(capturedMessages, 'Expected a language-model request to be issued');
+		const promptPart = capturedMessages[1].content[0];
+		if (promptPart.type !== 'text') {
+			throw new Error('Expected prompt text part');
+		}
+		assert.ok(promptPart.value.includes('Plan steps that need controls:'));
+		assert.ok(promptPart.value.includes('stepIndex: 1'));
+		assert.ok(promptPart.value.includes('stepIndex: 3'));
+		assert.ok(promptPart.value.includes('Return at least two and at most four controls for every listed stepIndex.'));
+		assert.ok(promptPart.value.includes('Use only singleSelect or multiSelect controls. Do not return text controls.'));
 	});
 
 	test('ranks task-lens-aligned questions ahead of generic repo questions', async () => {
@@ -794,6 +955,195 @@ suite('ChatPlanningQuestionGenerator', () => {
 		assert.ok(promptPart.value.includes('Artifact targeting:\nThe request points at Requested CSV file'));
 	});
 
+	test('uses follow-up goal clarity to surface editable assumptions without repeating answered analysis questions', async () => {
+		let capturedMessages: IChatMessage[] | undefined;
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['plan-model'],
+			getVendors: () => [],
+			lookupLanguageModel: () => ({ capabilities: { toolCalling: true } }),
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async () => [],
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async (_modelId: string, _from: unknown, messages: IChatMessage[]) => {
+				capturedMessages = messages;
+				return {
+					stream: (async function* () {
+						yield {
+							type: 'text' as const,
+							value: JSON.stringify({
+								questions: [
+									{ title: 'Analysis Type', message: 'What kind of analysis are you looking to do?', type: 'multiSelect', options: [{ label: 'Summary Statistics', value: 'Summary Statistics' }, { label: 'Compare Groups', value: 'Compare Groups' }] },
+									{ title: 'Analysis Goal', message: 'What do you want to learn, decide, or communicate with this analysis?', type: 'text' },
+									{ title: 'Data Caveats', message: 'What context about the data should shape the analysis?', type: 'text' },
+								]
+							})
+						};
+					})(),
+					result: Promise.resolve({})
+				};
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		const questions = await generateDynamicPlanningQuestions(service, {
+			userRequest: 'want to analyse a csv file',
+			modelId: undefined,
+			planningPhase: 'broad-scan',
+			questionStage: 'goal-clarity',
+			questionCount: 2,
+			missingDimensions: ['constraints'],
+			partialDimensions: ['scope-boundaries'],
+			focusHint: 'Review editable assumptions before drafting the first plan.',
+			recentConversation: [],
+			planningAnswers: [
+				{ question: 'What kind of analysis are you looking to do?', answer: 'Summary statistics, Group comparisons' },
+				{ question: 'What do you want to learn, decide, or communicate with this analysis?', answer: 'visualisation, result summary' },
+				{ question: 'Who is this analysis for?', answer: 'Technical Collaborators' },
+			],
+			repositoryContext: {
+				scope: 'focused',
+				workspaceRoot: 'file:///workspace',
+				planningTarget: { kind: 'file', label: 'data/orders.csv', confidence: 'high' },
+				requestIntent: 'data-analysis',
+				taskLens: {
+					taskKind: 'data-analysis',
+					primaryArtifact: 'data/orders.csv',
+					artifactType: 'dataset',
+					desiredOutcome: 'visualisation, result summary',
+					deliverableType: 'analysis',
+					validationTargets: ['Analysis output'],
+				},
+				primaryArtifactHint: 'data/orders.csv',
+				focusQueries: ['orders.csv'],
+				workspaceFolders: ['workspace'],
+				workingSetFiles: ['data/orders.csv'],
+				activeDocumentSymbols: [],
+				workspaceSymbolMatches: [],
+				nearbyFiles: [],
+				relevantSnippets: [],
+			}
+		}, CancellationToken.None);
+
+		assert.strictEqual(questions.length, 2);
+		assert.strictEqual(questions[0].id, 'dynamic-planning-plan-assumptions');
+		assert.strictEqual(questions[0].title, 'Working Assumptions');
+		assert.ok(questions[0].description?.includes('replace goal-clarification questions'));
+		assert.ok(!questions.some(question => question.id === 'dynamic-planning-analysis-kind'));
+		assert.ok(capturedMessages, 'Expected a language-model request to be issued');
+		const promptPart = capturedMessages[0].content[0];
+		if (promptPart.type !== 'text') {
+			throw new Error('Expected prompt text part');
+		}
+		assert.ok(promptPart.value.includes('include an editable assumptions review'));
+	});
+
+	test('filters goal clarity and assumption questions out of task decomposition', async () => {
+		let capturedMessages: IChatMessage[] | undefined;
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['plan-model'],
+			getVendors: () => [],
+			lookupLanguageModel: () => ({ capabilities: { toolCalling: true } }),
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async () => [],
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async (_modelId: string, _from: unknown, messages: IChatMessage[]) => {
+				capturedMessages = messages;
+				return {
+					stream: (async function* () {
+						yield {
+							type: 'text' as const,
+							value: JSON.stringify({
+								questions: [
+									{ title: 'Goal', message: 'What outcome should this achieve?', type: 'text' },
+									{ title: 'Scope', message: 'What is in or out of scope?', type: 'text' },
+									{ title: 'Success Criteria', message: 'What should success look like?', type: 'text' },
+									{ title: 'Working Assumptions', message: 'Which assumptions should shape the first plan?', type: 'multiSelect', options: [{ label: 'Keep scope narrow', value: 'Keep scope narrow' }, { label: 'Include validation', value: 'Include validation' }] },
+									{ title: 'Work Areas', message: 'Which work areas should shape the first plan?', type: 'multiSelect', options: [{ label: 'Data loading', value: 'Data loading' }, { label: 'Visualization', value: 'Visualization' }] },
+									{ title: 'Validation Path', message: 'Which validation path should the plan include?', type: 'singleSelect', options: [{ label: 'Smoke run', value: 'Smoke run' }, { label: 'Unit tests', value: 'Unit tests' }] },
+								]
+							})
+						};
+					})(),
+					result: Promise.resolve({})
+				};
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		const questions = await generateDynamicPlanningQuestions(service, {
+			userRequest: 'Plan how to analyze orders.csv.',
+			modelId: undefined,
+			planningPhase: 'focused-slice',
+			questionStage: 'task-decomposition',
+			questionCount: 2,
+			recentConversation: [],
+			planningAnswers: [
+				{ question: 'Analysis Goal', answer: 'visualisation and summary' },
+				{ question: 'Working Assumptions', answer: 'Keep scope narrow' },
+			],
+			repositoryContext: {
+				scope: 'focused',
+				workspaceRoot: 'file:///workspace',
+				planningTarget: { kind: 'file', label: 'data/orders.csv', confidence: 'high' },
+				requestIntent: 'data-analysis',
+				taskLens: {
+					taskKind: 'data-analysis',
+					primaryArtifact: 'data/orders.csv',
+					artifactType: 'dataset',
+					planAreas: ['Data loading', 'Visualization'],
+					validationTargets: ['Smoke run'],
+				},
+				primaryArtifactHint: 'data/orders.csv',
+				focusQueries: ['orders.csv'],
+				workspaceFolders: ['workspace'],
+				workingSetFiles: ['data/orders.csv'],
+				activeDocumentSymbols: [],
+				workspaceSymbolMatches: [],
+				nearbyFiles: [],
+				relevantSnippets: [],
+			}
+		}, CancellationToken.None);
+
+		assert.strictEqual(questions.length, 2);
+		assert.deepStrictEqual(questions.map(question => question.title), ['Work Areas', 'Validation Path']);
+		assert.ok(!questions.some(question => /goal|scope|success|assumption/i.test(question.title)));
+		assert.ok(capturedMessages, 'Expected a language-model request to be issued');
+		const systemPart = capturedMessages[0].content[0];
+		if (systemPart.type !== 'text') {
+			throw new Error('Expected system prompt text part');
+		}
+		assert.ok(!systemPart.value.includes('success criteria'));
+		const promptPart = capturedMessages[1].content[0];
+		if (promptPart.type !== 'text') {
+			throw new Error('Expected prompt text part');
+		}
+		assert.ok(promptPart.value.includes('Do not ask goal, scope, definition-of-done, or assumption-review questions here.'));
+	});
+
 	test('skips session-targeted models when choosing a fallback model', async () => {
 		let capturedModelId: string | undefined;
 		const service = {
@@ -1001,6 +1351,91 @@ suite('ChatPlanningQuestionGenerator', () => {
 		}, CancellationToken.None);
 
 		assert.strictEqual(capturedModelId, 'gpt-4.1');
+	});
+
+	test('defaults task-decomposition control generation to the fast Copilot model', async () => {
+		let capturedModelId: string | undefined;
+		const service = {
+			_serviceBrand: undefined,
+			onDidChangeLanguageModelVendors: Event.None,
+			onDidChangeLanguageModels: Event.None,
+			updateModelPickerPreference: () => { },
+			getLanguageModelIds: () => ['copilot/auto', 'copilot-fast', 'gpt-4.1', 'plan-model'],
+			getVendors: () => [],
+			lookupLanguageModel: (modelId: string) => {
+				if (modelId === 'copilot/auto') {
+					return { vendor: 'copilot', id: 'auto', family: 'auto', capabilities: { toolCalling: true } };
+				}
+				if (modelId === 'copilot-fast') {
+					return { vendor: 'copilot', id: 'copilot-fast', family: 'copilot-fast', capabilities: { toolCalling: true } };
+				}
+				if (modelId === 'gpt-4.1') {
+					return { vendor: 'copilot', id: 'gpt-4.1', family: 'gpt-4.1', capabilities: { toolCalling: true } };
+				}
+				return { vendor: 'test-vendor', id: 'plan-model', family: 'plan-model', capabilities: { toolCalling: true } };
+			},
+			lookupLanguageModelByQualifiedName: () => undefined,
+			getLanguageModelGroups: () => [],
+			selectLanguageModels: async (selector: { vendor?: string; id?: string; family?: string }) => {
+				if (selector.id === 'copilot-fast' || selector.family === 'copilot-fast') {
+					return ['copilot-fast'];
+				}
+				if (selector.id === 'gpt-4.1' || selector.family === 'gpt-4.1') {
+					return ['gpt-4.1'];
+				}
+				if (selector.vendor === 'copilot') {
+					return ['copilot-fast', 'gpt-4.1'];
+				}
+				return ['copilot-fast', 'gpt-4.1', 'plan-model'];
+			},
+			registerLanguageModelProvider: () => ({ dispose: () => { } }),
+			deltaLanguageModelChatProviderDescriptors: () => { },
+			sendChatRequest: async (modelId: string) => {
+				capturedModelId = modelId;
+				return {
+					stream: (async function* () {
+						yield {
+							type: 'text' as const,
+							value: JSON.stringify({
+								questions: [
+									{
+										title: 'Step order',
+										message: 'Which step should move first?',
+										type: 'singleSelect',
+										options: [
+											{ label: 'Tests first', value: 'Tests first' },
+											{ label: 'Code first', value: 'Code first' }
+										]
+									},
+									{ title: 'Missing check', message: 'What check is missing?', type: 'text' }
+								]
+							})
+						};
+					})(),
+					result: Promise.resolve({})
+				};
+			},
+			computeTokenLength: async () => 0,
+			getModelConfiguration: () => undefined,
+			setModelConfiguration: async () => { },
+			getModelConfigurationActions: () => [],
+			addLanguageModelsProviderGroup: async () => { },
+			removeLanguageModelsProviderGroup: async () => { },
+			configureLanguageModelsProviderGroup: async () => { },
+		} as unknown as ILanguageModelsService;
+
+		await generateDynamicPlanningQuestions(service, {
+			userRequest: 'Plan a change',
+			modelId: 'copilot/auto',
+			planningPhase: 'focused-slice',
+			questionStage: 'task-decomposition',
+			questionCount: 2,
+			currentPlan: '1. Add tests.\n2. Update code.',
+			recentConversation: [],
+			planningAnswers: [],
+		}, CancellationToken.None);
+
+		assert.strictEqual(capturedModelId, 'copilot-fast');
 	});
 
 	test('defaults planning question generation to GPT-4.1 when the current concrete model is stale', async () => {

@@ -53,10 +53,11 @@ export class ChatProgressContentPart extends Disposable implements IChatContentP
 	) {
 		super();
 		this.currentContent = progress.content;
+		const isStickyProgress = isStickyProgressMessage(progress);
 
 		const followingContent = context.content.slice(context.contentIndex + 1);
-		this.showSpinner = forceShowSpinner ?? shouldShowSpinner(followingContent, context.element);
-		this.isHidden = forceShowMessage !== true && followingContent.some(part => part.kind !== 'progressMessage');
+		this.showSpinner = forceShowSpinner ?? shouldShowSpinner(followingContent, context.element, isStickyProgress);
+		this.isHidden = !isStickyProgress && forceShowMessage !== true && followingContent.some(part => part.kind !== 'progressMessage');
 		if (this.isHidden) {
 			// Placeholder, don't show the progress message
 			this.domNode = $('');
@@ -109,12 +110,13 @@ export class ChatProgressContentPart extends Disposable implements IChatContentP
 	hasSameContent(other: IChatRendererContent, followingContent: IChatRendererContent[], element: ChatTreeItem): boolean {
 		// Progress parts render render until some other content shows up, then they hide.
 		// When some other content shows up, need to signal to be rerendered as hidden.
-		if (followingContent.some(part => part.kind !== 'progressMessage') && !this.isHidden) {
+		const isStickyProgress = other.kind === 'progressMessage' && other.isSticky === true;
+		if (!isStickyProgress && followingContent.some(part => part.kind !== 'progressMessage') && !this.isHidden) {
 			return false;
 		}
 
 		// Needs rerender when spinner state changes
-		const showSpinner = shouldShowSpinner(followingContent, element);
+		const showSpinner = shouldShowSpinner(followingContent, element, isStickyProgress);
 
 		// Needs rerender when content changes
 		if (other.kind === 'progressMessage' && other.content.value !== this.currentContent.value) {
@@ -129,8 +131,12 @@ export class ChatProgressContentPart extends Disposable implements IChatContentP
 	}
 }
 
-function shouldShowSpinner(followingContent: IChatRendererContent[], element: ChatTreeItem): boolean {
-	return isResponseVM(element) && !element.isComplete && followingContent.length === 0;
+function isStickyProgressMessage(progress: IChatProgressMessage | IChatTask | IChatTaskSerialized | { content: IMarkdownString }): progress is IChatProgressMessage {
+	return 'kind' in progress && progress.kind === 'progressMessage' && progress.isSticky === true;
+}
+
+function shouldShowSpinner(followingContent: IChatRendererContent[], element: ChatTreeItem, isStickyProgress = false): boolean {
+	return isResponseVM(element) && !element.isComplete && (isStickyProgress || followingContent.length === 0);
 }
 
 

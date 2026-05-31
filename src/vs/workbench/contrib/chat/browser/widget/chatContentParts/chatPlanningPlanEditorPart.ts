@@ -9,6 +9,7 @@ import { Button } from '../../../../../../base/browser/ui/button/button.js';
 import { Checkbox } from '../../../../../../base/browser/ui/toggle/toggle.js';
 import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable } from '../../../../../../base/common/lifecycle.js';
+import { hasKey } from '../../../../../../base/common/types.js';
 import { localize } from '../../../../../../nls.js';
 import { defaultButtonStyles, defaultCheckboxStyles } from '../../../../../../platform/theme/browser/defaultStyles.js';
 import { IChatMultiSelectAnswer, IChatPlanningPlanEditor, IChatQuestion, IChatQuestionAnswerValue, IChatQuestionAnswers, IChatService, IChatSingleSelectAnswer } from '../../../common/chatService/chatService.js';
@@ -17,12 +18,10 @@ import { isResponseVM } from '../../../common/model/chatViewModel.js';
 import { IChatContentPart, IChatContentPartRenderContext } from './chatContentParts.js';
 
 const $ = dom.$;
+const planningPlanRegenerateControlsAnswerKey = 'plan-editor-regenerate-controls';
+const planningPlanRegenerateControlsAnswerValue = 'regenerate-controls';
 
 interface IPlanningPlanEditorStepControls {
-	readonly keep: Checkbox;
-	readonly revise: Checkbox;
-	readonly defer: Checkbox;
-	readonly split: Checkbox;
 	readonly note: HTMLTextAreaElement;
 	readonly questions: readonly IPlanningPlanEditorQuestionControls[];
 }
@@ -41,7 +40,6 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 	public readonly onDidChangeHeight: Event<void> = this._onDidChangeHeight.event;
 
 	private readonly stepControls = new Map<string, IPlanningPlanEditorStepControls>();
-	private additionalNotes: HTMLTextAreaElement | undefined;
 	private applyButton: Button | undefined;
 
 	constructor(
@@ -65,32 +63,28 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 
 		const header = dom.append(this.domNode, $('.chat-planning-plan-editor-header'));
 		const title = dom.append(header, $('.chat-planning-plan-editor-title'));
-		title.textContent = localize('chat.planningPlanEditor.title', 'Plan Editor');
+		title.textContent = localize('chat.planningPlanEditor.title', 'Plan Canvas');
 
 		const subtitle = dom.append(header, $('.chat-planning-plan-editor-subtitle'));
-		subtitle.textContent = localize('chat.planningPlanEditor.subtitle', 'Review the generated plan in place. Each step has its own refinement question.');
+		subtitle.textContent = localize('chat.planningPlanEditor.subtitle', 'Review the plan and adjust steps.');
 
 		const stepsContainer = dom.append(this.domNode, $('.chat-planning-plan-editor-steps'));
 		for (const step of this.editor.steps) {
 			this.renderStep(stepsContainer, step);
 		}
 
-		const additional = dom.append(this.domNode, $('.chat-planning-plan-editor-additional'));
-		const additionalLabel = dom.append(additional, $('label.chat-planning-plan-editor-label'));
-		additionalLabel.textContent = localize('chat.planningPlanEditor.otherEdits', 'Other edits');
-		this.additionalNotes = dom.append(additional, $('textarea.chat-planning-plan-editor-textarea'));
-		this.additionalNotes.rows = 2;
-		this.additionalNotes.placeholder = localize('chat.planningPlanEditor.otherEditsPlaceholder', 'Add reordering, scope, validation, or missing-step notes.');
-		this._register(dom.addDisposableListener(this.additionalNotes, dom.EventType.INPUT, () => this.handleInputChange()));
-
 		const footer = dom.append(this.domNode, $('.chat-planning-plan-editor-footer'));
+		const regenerateControlsButton = this._register(new Button(footer, { ...defaultButtonStyles, secondary: true }));
+		regenerateControlsButton.label = localize('chat.planningPlanEditor.regenerateControls', 'Refresh controls');
+		this._register(regenerateControlsButton.onDidClick(() => this.submit('regenerateControls')));
+
 		const continueButton = this._register(new Button(footer, { ...defaultButtonStyles, secondary: true }));
 		continueButton.label = localize('chat.planningPlanEditor.continue', 'Continue');
-		this._register(continueButton.onDidClick(() => this.submit(false)));
+		this._register(continueButton.onDidClick(() => this.submit('continue')));
 
 		this.applyButton = this._register(new Button(footer, defaultButtonStyles));
-		this.applyButton.label = localize('chat.planningPlanEditor.applyEdits', 'Apply Edits');
-		this._register(this.applyButton.onDidClick(() => this.submit(true)));
+		this.applyButton.label = localize('chat.planningPlanEditor.applyEdits', 'Apply edits');
+		this._register(this.applyButton.onDidClick(() => this.submit('apply')));
 		this.updateApplyButton();
 	}
 
@@ -112,41 +106,16 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 		const store = this._register(new DisposableStore());
 		const questionControls = this.renderStepQuestions(stepElement, step, store);
 
-		const actions = dom.append(stepElement, $('.chat-planning-plan-editor-actions'));
-		const keep = this.createActionCheckbox(actions, store, localize('chat.planningPlanEditor.keep', 'Keep'), true);
-		const revise = this.createActionCheckbox(actions, store, localize('chat.planningPlanEditor.revise', 'Revise'));
-		const defer = this.createActionCheckbox(actions, store, localize('chat.planningPlanEditor.defer', 'Defer or remove'));
-		const split = this.createActionCheckbox(actions, store, localize('chat.planningPlanEditor.split', 'Split'));
-
 		const note = dom.append(stepElement, $<HTMLTextAreaElement>('textarea.chat-planning-plan-editor-textarea'));
 		note.rows = 1;
-		note.placeholder = localize('chat.planningPlanEditor.stepNotePlaceholder', 'Answer or add a note for this step');
+		note.placeholder = localize('chat.planningPlanEditor.stepNotePlaceholder', 'Describe another change for this step.');
 		this._register(dom.addDisposableListener(note, dom.EventType.INPUT, () => this.handleInputChange()));
 
-		const controls = { keep, revise, defer, split, note, questions: questionControls };
-		this.stepControls.set(step.id, controls);
-		for (const checkbox of [keep, revise, defer, split]) {
-			store.add(checkbox.onChange(() => {
-				if (checkbox !== keep && checkbox.checked) {
-					keep.checked = false;
-				}
-				if (checkbox === keep && keep.checked) {
-					revise.checked = false;
-					defer.checked = false;
-					split.checked = false;
-				}
-				if (!keep.checked && !revise.checked && !defer.checked && !split.checked) {
-					keep.checked = true;
-				}
-				this.handleInputChange();
-			}));
-		}
+		this.stepControls.set(step.id, { note, questions: questionControls });
 	}
 
 	private renderStepQuestions(stepElement: HTMLElement, step: IChatPlanningPlanEditor['steps'][number], store: DisposableStore): readonly IPlanningPlanEditorQuestionControls[] {
 		if (!step.questions?.length) {
-			const question = dom.append(stepElement, $('.chat-planning-plan-editor-step-question'));
-			question.textContent = this.getStepQuestion(step.kind);
 			return [];
 		}
 
@@ -229,19 +198,6 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 		return checkbox;
 	}
 
-	private getStepQuestion(kind: IChatPlanningPlanEditor['steps'][number]['kind']): string {
-		switch (kind) {
-			case 'verification':
-				return localize('chat.planningPlanEditor.verificationQuestion', 'Question: What evidence or check would make this verification step sufficient?');
-			case 'decision':
-				return localize('chat.planningPlanEditor.decisionQuestion', 'Question: What decision needs to be resolved before this step is useful?');
-			case 'guardrail':
-				return localize('chat.planningPlanEditor.guardrailQuestion', 'Question: What constraint or assumption should this guardrail capture?');
-			default:
-				return localize('chat.planningPlanEditor.stepQuestion', 'Question: What should change before this step is implemented?');
-		}
-	}
-
 	private handleInputChange(): void {
 		this.updateApplyButton();
 		this._onDidChangeHeight.fire();
@@ -254,12 +210,8 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 	}
 
 	private hasEdits(): boolean {
-		if (this.additionalNotes?.value.trim()) {
-			return true;
-		}
-
 		for (const controls of this.stepControls.values()) {
-			if (controls.revise.checked || controls.defer.checked || controls.split.checked || controls.note.value.trim()) {
+			if (controls.note.value.trim()) {
 				return true;
 			}
 			if (controls.questions.some(question => this.getQuestionAnswer(question) !== undefined)) {
@@ -270,12 +222,15 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 		return false;
 	}
 
-	private submit(requireEdits: boolean): void {
-		if (requireEdits && !this.hasEdits()) {
+	private submit(kind: 'apply' | 'continue' | 'regenerateControls'): void {
+		if (kind === 'apply' && !this.hasEdits()) {
 			return;
 		}
 
 		const answers = this.collectAnswers();
+		if (kind === 'regenerateControls') {
+			answers[planningPlanRegenerateControlsAnswerKey] = planningPlanRegenerateControlsAnswerValue;
+		}
 		this.editor.data = answers;
 		this.editor.isUsed = true;
 		this.renderSummary();
@@ -294,24 +249,10 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 				continue;
 			}
 
-			const selectedValues: string[] = [];
-			if (controls.keep.checked) {
-				selectedValues.push('keep');
+			const stepNote = controls.note.value.trim();
+			if (stepNote) {
+				answers[`plan-editor-step-custom-${step.id}`] = stepNote;
 			}
-			if (controls.revise.checked) {
-				selectedValues.push('revise');
-			}
-			if (controls.defer.checked) {
-				selectedValues.push('defer');
-			}
-			if (controls.split.checked) {
-				selectedValues.push('split');
-			}
-
-			answers[`plan-editor-step-${step.id}`] = {
-				selectedValues,
-				freeformValue: controls.note.value.trim() || undefined,
-			} satisfies IChatMultiSelectAnswer;
 
 			for (const questionControl of controls.questions) {
 				const answer = this.getQuestionAnswer(questionControl);
@@ -319,11 +260,6 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 					answers[`plan-editor-question-${step.id}-${questionControl.question.id}`] = answer;
 				}
 			}
-		}
-
-		const additional = this.additionalNotes?.value.trim();
-		if (additional) {
-			answers['plan-editor-additional'] = additional;
 		}
 
 		return answers;
@@ -365,13 +301,15 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 		this.domNode.classList.add('chat-planning-plan-editor-used');
 		const summary = dom.append(this.domNode, $('.chat-planning-plan-editor-summary'));
 		const title = dom.append(summary, $('.chat-planning-plan-editor-title'));
-		title.textContent = localize('chat.planningPlanEditor.summaryTitle', 'Plan Editor');
+		title.textContent = localize('chat.planningPlanEditor.summaryTitle', 'Plan Canvas');
 
 		const edits = this.countSubmittedEdits();
 		const detail = dom.append(summary, $('.chat-planning-plan-editor-subtitle'));
-		detail.textContent = edits > 0
-			? localize('chat.planningPlanEditor.summaryWithEdits', '{0} plan edit(s) submitted.', edits)
-			: localize('chat.planningPlanEditor.summaryNoEdits', 'No step edits submitted.');
+		detail.textContent = this.editor.data?.[planningPlanRegenerateControlsAnswerKey] === planningPlanRegenerateControlsAnswerValue
+			? localize('chat.planningPlanEditor.summaryRegeneratingControls', 'Refreshing controls.')
+			: edits > 0
+				? localize('chat.planningPlanEditor.summaryWithEdits', '{0} plan edit(s) submitted.', edits)
+				: localize('chat.planningPlanEditor.summaryNoEdits', 'No step edits submitted.');
 	}
 
 	private countSubmittedEdits(): number {
@@ -380,13 +318,17 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 			return 0;
 		}
 
-		let edits = typeof data['plan-editor-additional'] === 'string' && data['plan-editor-additional'].trim() ? 1 : 0;
+		let edits = 0;
 		for (const [key, value] of Object.entries(data)) {
+			if (key.startsWith('plan-editor-step-custom-') && typeof value === 'string' && value.trim()) {
+				edits++;
+				continue;
+			}
 			if (key.startsWith('plan-editor-question-') && this.hasSubmittedQuestionAnswer(value)) {
 				edits++;
 				continue;
 			}
-			if (typeof value !== 'object' || value === null || !('selectedValues' in value)) {
+			if (typeof value !== 'object' || value === null || !hasKey(value, { selectedValues: true })) {
 				continue;
 			}
 			const selectedValues = Array.isArray(value.selectedValues) ? value.selectedValues : [];
@@ -403,7 +345,7 @@ export class ChatPlanningPlanEditorPart extends Disposable implements IChatConte
 			return !!value.trim();
 		}
 
-		if ('selectedValues' in value) {
+		if (hasKey(value, { selectedValues: true })) {
 			return value.selectedValues.length > 0 || !!value.freeformValue?.trim();
 		}
 

@@ -727,6 +727,16 @@ export class Response extends AbstractResponse implements IDisposable {
 				this.clearToPreviousToolInvocation();
 			}
 			return;
+		} else if (progress.kind === 'progressMessage' && progress.id) {
+			const existingIndex = this._responseParts.findIndex(part => part.kind === 'progressMessage' && part.id === progress.id);
+			if (existingIndex >= 0) {
+				this._responseParts[existingIndex] = progress;
+			} else if (progress.isSticky) {
+				this._responseParts.unshift(progress);
+			} else {
+				this._responseParts.push(progress);
+			}
+			this._contentChanged(quiet);
 		} else if (progress.kind === 'markdownContent') {
 
 			// last response which is NOT a text edit group because we do want to support heterogenous streaming but not have
@@ -2583,6 +2593,14 @@ export class ChatModel extends Disposable implements IChatModel {
 		}
 
 		if (request.response.isComplete) {
+			if (progress.kind === 'progressMessage'
+				&& progress.id
+				&& request.response.entireResponse.value.some(part => part.kind === 'progressMessage' && part.id === progress.id)
+			) {
+				request.response.updateContent(progress, quiet);
+				return;
+			}
+
 			throw new Error('acceptResponseProgress: Adding progress to a completed response');
 		}
 

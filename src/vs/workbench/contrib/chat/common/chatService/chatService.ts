@@ -232,6 +232,8 @@ export interface IChatProgressMessage {
 	content: IMarkdownString;
 	kind: 'progressMessage';
 	shimmer?: boolean;
+	id?: string;
+	isSticky?: boolean;
 }
 
 export interface IChatTask extends IChatTaskDto {
